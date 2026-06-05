@@ -13,7 +13,7 @@ export default {
     // ============================================
     try {
       const classification = await env.AI.run(
-        "@cf/meta/llama-3-8b-instruct",
+  "@cf/meta/llama-3.1-8b-instruct",
         {
           messages: [
             {
