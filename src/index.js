@@ -1,6 +1,5 @@
 export default {
   async email(message, env, ctx) {
-
     const from = message.from;
     const to = message.to;
     const subject = message.headers.get("subject") || "(no subject)";
@@ -13,7 +12,7 @@ export default {
     // ============================================
     try {
       const classification = await env.AI.run(
-  "@cf/meta/llama-3.1-8b-instruct",
+        "@cf/meta/llama-3.1-8b-instruct",
         {
           messages: [
             {
@@ -25,24 +24,19 @@ export default {
               content: `Classify this email:
 From: ${from}
 Subject: ${subject}
-
 Reply with only SPAM or LEGITIMATE.`
             }
           ],
           max_tokens: 10,
         }
       );
-
       const result = classification?.response?.trim().toUpperCase();
-
       if (result === "SPAM") {
         console.log(`[ZeroDrop] Dropped spam from ${from} — subject: ${subject}`);
         return; // Silent drop — never hits Redis
       }
-
     } catch (aiError) {
       // If AI fails, allow the email through
-      // Never drop legitimate emails due to AI errors
       console.log(`[ZeroDrop] AI filter error — allowing email through: ${aiError.message}`);
     }
 
@@ -51,6 +45,37 @@ Reply with only SPAM or LEGITIMATE.`
     // ============================================
     const rawEmail = await new Response(message.raw).text();
 
+    // ============================================
+    // OTP + MAGIC LINK EXTRACTION
+    // Extracted at the edge so SDK and Action
+    // can expose them as first-class fields
+    // ============================================
+
+    // Extract plain text body for parsing
+    const plainMatch = rawEmail.match(
+      /Content-Type: text\/plain[^\r\n]*\r\n(?:Content-Transfer-Encoding:[^\r\n]*\r\n)?\r\n([\s\S]*?)(?:\r\n--|\r\n\r\n--)/
+    );
+    const bodyText = plainMatch
+      ? plainMatch[1].replace(/=\r\n/g, "").replace(/=([0-9A-F]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16))).trim()
+      : rawEmail;
+
+    // Magic link — first https URL containing common auth path segments
+    const magicLinkMatch = bodyText.match(
+      /https?:\/\/[^\s<>"]+(?:verify|confirm|reset|magic|token|activate|auth)[^\s<>"']*/i
+    );
+    const magicLink = magicLinkMatch ? magicLinkMatch[0].replace(/[.,;!?)]+$/, "") : null;
+
+    // OTP — standalone 4-8 digit code on its own line or after common labels
+    const otpMatch = bodyText.match(
+      /(?:code|otp|pin|token|verification|one.time)[^\d]{0,30}(\d{4,8})|(?:^|\s)(\d{4,8})(?:\s|$)/im
+    );
+    const otp = otpMatch ? (otpMatch[1] || otpMatch[2]) : null;
+
+    console.log(`[ZeroDrop] Extracted — otp: ${otp ?? "none"}, magicLink: ${magicLink ? "found" : "none"}`);
+
+    // ============================================
+    // BUILD EMAIL PAYLOAD
+    // ============================================
     const emailPayload = {
       id: messageId,
       from,
@@ -58,13 +83,14 @@ Reply with only SPAM or LEGITIMATE.`
       subject,
       receivedAt: new Date().toISOString(),
       raw: rawEmail,
+      otp,
+      magicLink,
     };
 
     // ============================================
     // PUSH TO REDIS
     // ============================================
     const redisUrl = `${env.UPSTASH_REDIS_REST_URL}/lpush/inbox:${inboxName}`;
-
     const response = await fetch(redisUrl, {
       method: "POST",
       headers: {
