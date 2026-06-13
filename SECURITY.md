@@ -39,6 +39,19 @@ OTPs and magic links are extracted at the edge using regex pattern matching on t
 
 ---
 
+## Zero Telemetry
+
+ZeroDrop does not track your test suites, build environments, project names, or CI runner metadata.
+
+- The GitHub Action generates inbox names locally on the runner — no network request is made during generation
+- The SDK does not send analytics, usage metrics, or environment data to any server
+- No telemetry is collected from your CI pipeline, repository, or developer machine
+- The only network requests made are explicit inbox polls to `zerodrop.dev/api/inbox/{name}` — nothing else
+
+Your CI pipeline is your business. We have no visibility into what you're testing, what your project is called, or what environment you're running in.
+
+---
+
 ## AI Spam Filter — Cloudflare Workers AI
 
 ZeroDrop uses Llama 3.1 (8B instruct) for spam classification via **Cloudflare Workers AI**.
