@@ -4,6 +4,8 @@
 
 This is the edge worker that catches inbound emails for [zerodrop.dev](https://zerodrop.dev), filters spam with Llama 3.1, and stores them in Upstash Redis with a 30-minute TTL.
 
+**[Documentation](https://docs.zerodrop.dev)** · [Self-Hosting Guide](https://docs.zerodrop.dev/self-hosting) · [SECURITY.md](SECURITY.md)
+
 ---
 
 ## What it does
