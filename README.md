@@ -1,8 +1,20 @@
 # zerodrop-worker
 
-> Cloudflare Worker that powers ZeroDrop's email routing layer
+Edge infrastructure for email verification — catches inbound emails, filters spam with Llama 3.1, and auto-extracts OTPs and magic links before storing in Redis.
 
-This is the edge worker that catches inbound emails for [zerodrop.dev](https://zerodrop.dev), filters spam with Llama 3.1, and stores them in Upstash Redis with a 30-minute TTL.
+This is the open-source backend that powers [zerodrop.dev](https://zerodrop.dev). Runs entirely on Cloudflare's edge — no server, no SMTP, no maintenance.
+
+```
+Inbound email → Cloudflare Email Routing
+                      ↓
+              zerodrop-worker (this repo)
+                      ↓
+         Cloudflare Workers AI (Llama 3.1 spam filter)
+                      ↓ (LEGITIMATE only)
+              OTP + magic link extraction
+                      ↓
+              Upstash Redis · TTL 1800s
+```
 
 **[Documentation](https://docs.zerodrop.dev)** · [Self-Hosting Guide](https://docs.zerodrop.dev/self-hosting) · [SECURITY.md](SECURITY.md)
 
@@ -14,26 +26,8 @@ This is the edge worker that catches inbound emails for [zerodrop.dev](https://z
 2. **Parses the MIME payload** — extracts from, to, subject, message-id, and raw body
 3. **Runs Llama 3.1 spam filter** — classifies the email as SPAM or LEGITIMATE using Cloudflare Workers AI
 4. **Drops spam silently** — spam never reaches Redis
-5. **Stores legitimate emails** in Upstash Redis — key pattern `inbox:{name}`, TTL 1800s (30 min)
-
----
-
-## Architecture
-
-```
-Inbound email → Cloudflare Email Routing
-                      ↓
-              zerodrop-worker (this repo)
-                      ↓
-         Cloudflare Workers AI (Llama 3.1)
-                      ↓ (LEGITIMATE only)
-              Upstash Redis (ap-south-1)
-              key: inbox:{name}
-              TTL: 1800s
-                      ↓
-         zerodrop-dashboard polls /api/inbox/{name}
-         zerodrop-client SDK polls via waitForLatest()
-```
+5. **Auto-extracts OTPs and magic links** — runs regex at the edge so your test suite gets `email.otp` and `email.magicLink` directly
+6. **Stores legitimate emails** in Upstash Redis — key pattern `inbox:{name}`, TTL 1800s (30 min)
 
 ---
 
@@ -79,7 +73,6 @@ For supply chain security when using the GitHub Action, pin to a specific commit
 ```yaml
 # Instead of:
 uses: zerodrop-dev/create-inbox@v1
-
 # Pin to a specific commit:
 uses: zerodrop-dev/create-inbox@4eb0c06  # v1.0.0
 ```
