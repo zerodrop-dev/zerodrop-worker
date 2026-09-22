@@ -19,6 +19,68 @@ function normalizeInboxName(raw) {
 // live run the classifier dropped a plain "test mail 3" from Gmail.
 const SPAM_FILTER_MODE = "shadow";
 
+// ============================================
+// SENDER-DOMAIN CAP
+// ============================================
+// Caps how many DISTINCT inboxes one sender domain can reach per hour.
+// Legitimate CI sends from the tester's own app domain to a handful of
+// inboxes; registration farming sends from a big platform to a fresh inbox
+// per fake account. Week of Sep 15-22: every legitimate sender reached 1
+// inbox/hour; deepseek.com reached 126.
+//   "shadow"  — count and log "would block", store the email anyway (current)
+//   "enforce" — reject mail past the threshold
+const CAP_MODE = "shadow";
+const CAP_PER_HOUR = 20;
+
+// Integrated users from USERS.md — exempt so parallel CI suites are never
+// capped. Parent domains only. posteo.com deliberately NOT listed: it's a
+// consumer mailbox provider, so allowlisting it would exempt anyone.
+const CAP_ALLOWLIST = new Set([
+  "khangames.mn",
+  "dev.krd",
+  "salus.co.uk",
+  "evalubox.com",
+]);
+
+// Collapse subdomains to the parent: sc.mail.deepseek.com -> deepseek.com,
+// em2795.salus.co.uk -> salus.co.uk. Heuristic, not a full public-suffix list.
+const MULTI_PART_SLD = new Set(["co", "com", "org", "net", "ac", "gov", "edu"]);
+function parentDomain(host) {
+  const labels = String(host).toLowerCase().replace(/\.$/, "").split(".").filter(Boolean);
+  if (labels.length <= 2) return labels.join(".");
+  const tld = labels[labels.length - 1];
+  const sld = labels[labels.length - 2];
+  const take = tld.length === 2 && MULTI_PART_SLD.has(sld) ? 3 : 2;
+  return labels.slice(-take).join(".");
+}
+
+// Consumer mailbox providers are shared by millions of unrelated people, so
+// for them the cap counts per full sender ADDRESS, not per domain: one person
+// hitting 21 inboxes an hour is still caught; 1,000 Gmail users sending one
+// email each never collide.
+const CONSUMER_MAILBOX = new Set([
+  "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+  "yahoo.com", "icloud.com", "me.com", "aol.com", "proton.me",
+  "protonmail.com", "posteo.com", "gmx.com", "gmx.de", "zoho.com",
+]);
+
+// Key on the header From domain, not the envelope sender: ESP customers
+// share envelope domains (amazonses.com, sendgrid.net) and must not share
+// one counter. Falls back to the envelope if the header can't be parsed.
+function senderAddress(headerFrom, envelopeFrom) {
+  const h = headerFrom || "";
+  const m = /<([^<>\s]+@[^<>\s]+)>/.exec(h) || /([^\s<>"]+@[^\s<>"]+)/.exec(h);
+  return ((m ? m[1] : envelopeFrom) || "").toLowerCase();
+}
+
+// Returns { domain, identity }: domain for the allowlist, identity for the
+// cap counter (the full address for consumer mailboxes, else the domain).
+function capIdentity(headerFrom, envelopeFrom) {
+  const addr = senderAddress(headerFrom, envelopeFrom);
+  const domain = parentDomain(addr.split("@").pop());
+  return { domain, identity: CONSUMER_MAILBOX.has(domain) ? addr : domain };
+}
+
 // Header values are sender-controlled and go into an LLM prompt: flatten and
 // truncate so they can't restructure the prompt.
 function promptSafe(value) {
@@ -37,6 +99,44 @@ export default {
       console.log(`[ZeroDrop] Rejected invalid recipient local part from ${from}`);
       message.setReject("Invalid recipient");
       return;
+    }
+
+    // ============================================
+    // SENDER-DOMAIN CAP CHECK
+    // ============================================
+    // capKey is only set when the sender is subject to the cap; the inbox is
+    // added to the hourly set in the same transaction that stores the email,
+    // so the set holds admitted inboxes only. Fails open on Redis errors.
+    const { domain, identity } = capIdentity(message.headers.get("from"), from);
+    let capKey = null;
+    if (domain && !CAP_ALLOWLIST.has(domain)) {
+      capKey = `cap:${identity}:${new Date().toISOString().slice(0, 13)}`;
+      try {
+        const capRes = await fetch(`${env.UPSTASH_REDIS_REST_URL}/pipeline`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify([
+            ["SISMEMBER", capKey, inboxName],
+            ["SCARD", capKey],
+          ]),
+        });
+        const [member, card] = await capRes.json();
+        const known = member?.result === 1;
+        const count = Number(card?.result ?? 0);
+        if (!known && count >= CAP_PER_HOUR) {
+          if (CAP_MODE === "enforce") {
+            console.log(`[ZeroDrop] Cap blocked sender=${identity} inbox=${inboxName} distinct_this_hour=${count}`);
+            message.setReject("Too many recipients from this sender; try again later");
+            return;
+          }
+          console.log(`[ZeroDrop] Cap would block (shadow) sender=${identity} inbox=${inboxName} distinct_this_hour=${count}`);
+        }
+      } catch (capError) {
+        console.log(`[ZeroDrop] Cap check error — allowing email through: ${capError.message}`);
+      }
     }
 
     // ============================================
@@ -141,6 +241,9 @@ Reply with only SPAM or LEGITIMATE.`
       body: JSON.stringify([
         ["LPUSH", key, JSON.stringify([JSON.stringify(emailPayload)])],
         ["EXPIRE", key, "1800"],
+        // Record this inbox against the sender's hourly cap set (2h TTL
+        // covers the whole hour bucket).
+        ...(capKey ? [["SADD", capKey, inboxName], ["EXPIRE", capKey, "7200"]] : []),
       ]),
     });
 
