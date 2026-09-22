@@ -20,6 +20,43 @@ function normalizeInboxName(raw) {
 const SPAM_FILTER_MODE = "shadow";
 
 // ============================================
+// OTP EXTRACTION
+// ============================================
+// Two passes, labelled first: a code next to a word like "code" or "OTP" beats
+// a bare number anywhere in the body. The old single regex scanned left to
+// right, so "(c) 2026" in a preheader won over the real code further down.
+// The bare-number fallback runs only when a plain-text part was parsed (never
+// against raw MIME, whose headers are full of digits) and skips values that
+// are almost certainly not codes: years, and numbers next to a currency
+// symbol or percent sign.
+const OTP_LABELLED = /(?:one[\s-]?time(?:\s+(?:code|password|pin))?|verification\s+(?:code|pin)|security\s+code|access\s+code|confirmation\s+code|passcode|\botp\b|\bcode\b|\bpin\b)[^\d]{0,30}(\d{4,8})/i;
+const OTP_BARE = /(?:^|[\s>])(\d{4,8})(?=[\s<.,!]|$)/gm;
+
+function looksLikeYear(value) {
+  if (value.length !== 4) return false;
+  const n = Number(value);
+  return n >= 1900 && n <= 2099;
+}
+
+function extractOtp(bodyText, plainTextParsed) {
+  const labelled = OTP_LABELLED.exec(bodyText);
+  if (labelled) return labelled[1];
+  if (!plainTextParsed) return null;
+
+  for (const m of bodyText.matchAll(OTP_BARE)) {
+    const value = m[1];
+    if (looksLikeYear(value)) continue;
+    const before = bodyText.slice(Math.max(0, m.index - 12), m.index);
+    const after = bodyText.slice(m.index + m[0].length, m.index + m[0].length + 2);
+    if (/[$£€₹¥]\s*$/.test(before)) continue;        // prices
+    if (/©|\(c\)|copyright/i.test(before)) continue;  // footer years
+    if (/^\s*%/.test(after)) continue;                // percentages
+    return value;
+  }
+  return null;
+}
+
+// ============================================
 // SENDER-DOMAIN CAP
 // ============================================
 // Caps how many DISTINCT inboxes one sender domain can reach per hour.
@@ -201,11 +238,8 @@ Reply with only SPAM or LEGITIMATE.`
     );
     const magicLink = magicLinkMatch ? magicLinkMatch[0].replace(/[.,;!?)]+$/, "") : null;
 
-    // OTP — standalone 4-8 digit code on its own line or after common labels
-    const otpMatch = bodyText.match(
-      /(?:code|otp|pin|token|verification|one.time)[^\d]{0,30}(\d{4,8})|(?:^|\s)(\d{4,8})(?:\s|$)/im
-    );
-    const otp = otpMatch ? (otpMatch[1] || otpMatch[2]) : null;
+    // OTP — labelled codes first, then a guarded bare-number fallback
+    const otp = extractOtp(bodyText, Boolean(plainMatch));
 
     // Log presence only — never the code itself. Worker logs are retained for
     // 7 days; one-time codes must not outlive the 30-minute inbox TTL.
