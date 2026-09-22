@@ -207,7 +207,9 @@ Reply with only SPAM or LEGITIMATE.`
     );
     const otp = otpMatch ? (otpMatch[1] || otpMatch[2]) : null;
 
-    console.log(`[ZeroDrop] Extracted — otp: ${otp ?? "none"}, magicLink: ${magicLink ? "found" : "none"}`);
+    // Log presence only — never the code itself. Worker logs are retained for
+    // 7 days; one-time codes must not outlive the 30-minute inbox TTL.
+    console.log(`[ZeroDrop] Extracted — otp: ${otp ? "found" : "none"}, magicLink: ${magicLink ? "found" : "none"}`);
 
     // ============================================
     // BUILD EMAIL PAYLOAD
