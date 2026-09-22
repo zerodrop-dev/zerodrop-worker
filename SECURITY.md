@@ -109,7 +109,7 @@ For teams under SOC2, GDPR, or HIPAA auditing: the spam filter processes only th
 
 ## GitHub Action Security
 
-The `zerodrop-dev/create-inbox` Action generates inbox names **locally on the runner** — no network request is made during the generation step. The inbox address is a random string; it does not contact ZeroDrop servers until your tests begin polling.
+The `zerodrop-dev/setup-zerodrop` Action generates inbox names **locally on the runner** — no network request is made during the generation step. The inbox address is a random string; it does not contact ZeroDrop servers until your tests begin polling.
 
 ### Supply chain hardening
 
@@ -117,7 +117,7 @@ Pin to a specific commit SHA rather than a floating tag:
 
 ```yaml
 # Recommended for production
-uses: zerodrop-dev/create-inbox@8706a59  # v1.0.0
+uses: zerodrop-dev/setup-zerodrop@36c6685cce921fbe8b6353a71292c8e262124e3e  # v1.0.0
 ```
 
 ### Action permissions
