@@ -9,52 +9,89 @@ ZeroDrop is a disposable email inbox service built for CI/CD pipelines. This doc
 ## Data Handling
 
 ### What gets stored
-- **Inbox name** (e.g. `swift-x7k2m`) — derived from the recipient address
+- **Inbox name** (e.g. `dark-gglag`) — derived from the recipient address
 - **Raw email payload** — MIME message including headers, subject, and body
 - **Received timestamp** — UTC time of receipt
 - **Extracted OTP** — 4-8 digit code if detected in the email body (null otherwise)
 - **Extracted magic link** — verification or reset URL if detected (null otherwise)
+- **Abuse counters** — for each sending domain (or full address, for consumer
+  mailbox providers), the set of inbox names it reached in the current hour.
+  Used only for rate limiting; expires after 2 hours.
 
-### What never gets stored
-- Sender IP addresses
+### What we don't store
 - Authentication tokens or cookies
-- Any data outside the email payload itself
+- Any data outside the email payload, the abuse counters above, and the logs below
+
+Note: the raw MIME payload we store for 30 minutes includes the message's own
+`Received:` headers, which typically contain the sending relay's IP address. We
+don't extract or index those, but they are part of the payload until the TTL
+deletes it.
+
+### Logs
+Cloudflare retains this worker's logs for 7 days. They record the sender,
+recipient, subject line, and whether an OTP or magic link was found — **never
+the code or link itself**. Our dashboard host and Cloudflare also keep standard
+request logs (IP address, user agent, request path) for up to 7 days.
 
 ### Retention
-All inbox data is stored in Upstash Redis with a **30-minute TTL**. After 30 minutes, the key is automatically deleted by Redis — no manual cleanup required, no data persists.
+All inbox data is stored in Upstash Redis with a **30-minute TTL**. The email and
+its expiry are written in a single atomic transaction, so a message cannot be
+stored without its deletion timer.
 
-### Edge parsing
-Email parsing happens entirely inside the Cloudflare Worker at the edge — before any data reaches Redis. The worker:
-1. Extracts from, to, subject, message-id, and raw body from the MIME payload
-2. Runs Llama 3.1 spam classification (SPAM / LEGITIMATE) via Cloudflare Workers AI
-3. Silently drops spam — it never reaches Redis
-4. Extracts OTP codes and magic links via regex on the plain-text body
-5. Stores only legitimate emails under `inbox:{name}` with a 1800s TTL
+### Edge processing
+Processing happens entirely inside the Cloudflare Worker at the edge — before any
+data reaches Redis. The worker:
+1. Validates the recipient address; malformed addresses are rejected
+2. Checks the sender against an hourly cap on distinct inboxes per sending domain
+3. Runs Llama 3.1 spam classification (SPAM / LEGITIMATE) via Cloudflare Workers AI
+4. Extracts OTP codes and magic links from the plain-text body
+5. Stores the message under `inbox:{name}` with a 1800s TTL, atomically
+
+**Controls 2 and 3 currently run in monitoring mode.** They log what they would
+block instead of blocking it, so that legitimate test mail isn't lost to a false
+positive while the thresholds and the classifier are being tuned. Recipient
+validation (1) does reject mail.
 
 The worker source code is fully auditable:
 → https://github.com/zerodrop-dev/zerodrop-worker
 
 ### OTP and verification codes
-OTPs and magic links are extracted at the edge using regex pattern matching on the plain-text email body. They are stored alongside the raw email payload in Redis and expire after 30 minutes along with the rest of the inbox data. Extraction happens entirely within Cloudflare's infrastructure — no external service is called.
+OTPs and magic links are extracted at the edge using pattern matching on the
+plain-text email body. Codes adjacent to a label ("code", "OTP", "verification
+code", and similar) are preferred; a bare number is used only as a fallback, and
+values that look like years, prices or percentages are skipped. They are stored
+alongside the raw email payload in Redis and expire after 30 minutes with the
+rest of the inbox data. Extraction happens entirely within Cloudflare's
+infrastructure — no external service is called, and codes are never written to
+logs.
 
 ---
 
-## Zero Telemetry
+## Client Telemetry
 
-ZeroDrop does not track your test suites, build environments, project names, or CI runner metadata.
+ZeroDrop's clients send no telemetry. The service itself necessarily sees the
+mail you send to it.
 
-- The GitHub Action generates inbox names locally on the runner — no network request is made during generation
-- The SDK does not send analytics, usage metrics, or environment data to any server
-- No telemetry is collected from your CI pipeline, repository, or developer machine
-- The only network requests made are explicit inbox polls to `zerodrop.dev/api/inbox/{name}` — nothing else
+- The GitHub Action generates inbox names locally on the runner — no network
+  request is made during generation
+- The SDKs and MCP server send no analytics, usage metrics, or environment data
+- No data is collected from your CI pipeline, repository, or developer machine
+- The only network requests are the inbox polls you invoke, which carry a static
+  source tag (for example `?source=go-sdk`) identifying the client library
 
-Your CI pipeline is your business. We have no visibility into what you're testing, what your project is called, or what environment you're running in.
+What we do see, because it arrives in the mail itself: the inbox names you use,
+and the sender, subject and timestamps of messages sent to them. We use this for
+usage analytics and abuse detection — see the
+[Privacy Policy](https://zerodrop.dev/privacy). We have no visibility into your
+repository, your build environment, or your machine.
 
 ---
 
 ## AI Spam Filter — Cloudflare Workers AI
 
-ZeroDrop uses Llama 3.1 (8B instruct) for spam classification via **Cloudflare Workers AI**.
+ZeroDrop uses Llama 3.1 (8B instruct, `@cf/meta/llama-3.1-8b-instruct-fp8`) for
+spam classification via **Cloudflare Workers AI**. As noted above, the filter
+currently runs in monitoring mode: it classifies and logs, but does not drop mail.
 
 **Critical compliance note:** This model runs entirely within Cloudflare's infrastructure. Email content is **never sent to an external AI provider** (OpenAI, Anthropic, Groq, or any third party). The inference happens inside the same Cloudflare Worker that receives the email — no data leaves Cloudflare's network for AI processing.
 
@@ -94,7 +131,15 @@ The free tier routes email through a shared domain (`zerodrop-sandbox.online`). 
 
 **Risk:** Shared sending domains can be flagged by disposable email detection libraries used by some identity providers (Auth0, Clerk, and similar). If your application rejects disposable email addresses, tests using the free tier sandbox domain will fail.
 
-**Mitigation:** Production CI pipelines should use ZeroDrop Workspaces with a custom domain (`@testing.yourcompany.com`). Custom domains are private, isolated, and not shared with other users — they will not appear on disposable email blocklists.
+**Also worth knowing:** on the free tier, the inbox name *is* the access control.
+Anyone who knows or guesses a name can read that inbox. Names are random and
+generated client-side, and mail is deleted after 30 minutes, but the free tier is
+not the right place for anything sensitive.
+
+**Mitigation:** Production CI pipelines should use ZeroDrop Workspaces, which
+receive mail on a domain used only by your team rather than the shared sandbox
+domain, so shared-domain blocklists don't apply. Workspaces are set up
+individually with each customer today — email founder@zerodrop.dev.
 
 ---
 
@@ -136,13 +181,14 @@ We will acknowledge receipt within 48 hours and aim to resolve critical issues w
 
 | Threat | Mitigation |
 |--------|-----------|
-| Inbox enumeration | Inbox names are random 9-character strings — brute force is impractical within the 30-min window |
-| Data persistence | Hard Redis TTL — data cannot persist beyond 30 minutes regardless of application logic |
+| Inbox enumeration | Names are random and generated client-side; the 30-minute TTL limits the window. But the name is the only access control on the free tier — treat free-tier inboxes as public |
+| Data persistence | Hard Redis TTL, written atomically with the message — data cannot persist beyond 30 minutes regardless of application logic |
+| Malformed recipient addresses | Validated at the worker and in the read API; only `[a-z0-9._+-]` names up to 64 characters are accepted |
 | Supply chain attack via Action | SHA pinning documented; worker source is auditable |
-| OTP theft | 30-min TTL limits exposure window; OTPs are only accessible to whoever knows the inbox name |
-| Spam flooding | Llama 3.1 spam filter drops automated spam at the edge before Redis writes |
+| OTP theft | 30-min TTL limits exposure window; codes are never written to logs; on the free tier they're accessible to whoever knows the inbox name |
+| Spam and registration farming | Hourly cap on distinct inboxes per sending domain, plus Llama 3.1 classification — both in monitoring mode while being tuned; see Edge processing |
 | AI data leak | Cloudflare Workers AI — inference runs on Cloudflare's network, no external AI provider |
-| Shared domain blocklist | Free tier risk documented; Workspaces custom domains are isolated and private |
+| Shared domain blocklist | Free tier risk documented; Workspaces use a domain dedicated to your team |
 
 ---
 
