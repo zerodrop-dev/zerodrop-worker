@@ -8,7 +8,7 @@ This is the open-source backend that powers [zerodrop.dev](https://zerodrop.dev)
 Inbound email → Cloudflare Email Routing
                       ↓
               zerodrop-worker (this repo)
-    recipient check · sender blocklist · hourly sender cap
+  recipient check · sender blocklist · daily keyless allowance
                       ↓
               OTP + magic link extraction
                       ↓
@@ -24,7 +24,7 @@ Inbound email → Cloudflare Email Routing
 1. **Receives email** via Cloudflare Email Routing — every email sent to `*@zerodrop-sandbox.online` triggers this worker
 2. **Validates the recipient** — malformed inbox names are rejected
 3. **Rejects blocked senders** — a short list of platforms whose verification codes were being farmed through free inboxes
-4. **Checks an hourly cap** on distinct inboxes per sending domain (per address for consumer mailbox providers) — monitoring mode: logged, not enforced
+4. **Counts a keyless allowance** — without an API key, one sender can reach 5 different inboxes a day (counted per address for consumer mailbox providers); inboxes under an account's namespace aren't counted — monitoring mode: logged, not enforced
 5. **Auto-extracts OTPs and magic links** at the edge, so your test suite gets `email.otp` and `email.magicLink` directly
 6. **Stores the email** in Upstash Redis — key `inbox:{name}`, TTL 1800s (30 min), written atomically with its expiry
 
@@ -38,7 +38,8 @@ Secrets are stored as Cloudflare Worker secrets — never in code or git history
 |----------|-------------|
 | `UPSTASH_REDIS_REST_URL` | Upstash Redis REST endpoint |
 | `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST token |
-| `CAP_ALLOWLIST` | Optional. Comma-separated sender domains exempt from the hourly cap |
+| `CAP_ALLOWLIST` | Optional. Comma-separated sender domains exempt from the keyless allowance |
+| `ALLOWLIST_UNTIL` | Optional. A date (`YYYY-MM-DD`, UTC) after which `CAP_ALLOWLIST` stops applying |
 
 No other bindings are needed. The worker runs no AI model.
 
@@ -56,7 +57,8 @@ Set your secrets in the Cloudflare dashboard or via:
 ```bash
 npx wrangler secret put UPSTASH_REDIS_REST_URL
 npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
-npx wrangler secret put CAP_ALLOWLIST   # optional
+npx wrangler secret put CAP_ALLOWLIST     # optional
+npx wrangler secret put ALLOWLIST_UNTIL   # optional
 ```
 
 ---

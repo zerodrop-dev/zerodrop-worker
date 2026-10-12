@@ -15,8 +15,8 @@ ZeroDrop is a disposable email inbox service built for CI/CD pipelines. This doc
 - **Extracted OTP** — 4-8 digit code if detected in the email body (null otherwise)
 - **Extracted magic link** — verification or reset URL if detected (null otherwise)
 - **Abuse counters** — for each sending domain (or full address, for consumer
-  mailbox providers), the set of inbox names it reached in the current hour.
-  Used only for rate limiting; expires after 2 hours.
+  mailbox providers), the set of inbox names it reached in the current UTC day.
+  Used only for the keyless allowance; expires after 2 days.
 
 ### What we don't store
 - Authentication tokens or cookies
@@ -51,13 +51,16 @@ data reaches Redis. The worker:
 1. Validates the recipient address; malformed addresses are rejected
 2. Rejects mail from a short list of platforms whose verification codes were
    being farmed through free inboxes
-3. Checks the sender against an hourly cap on distinct inboxes per sending domain
+3. Counts the sender against a keyless allowance: 5 different inboxes a day per
+   sending domain (per address for consumer mailbox providers). Inboxes under a
+   registered account namespace aren't counted
 4. Extracts OTP codes and magic links from the plain-text body
 5. Stores the message under `inbox:{name}` with a 1800s TTL, atomically
 
-**The hourly cap (3) currently runs in monitoring mode.** It logs what it would
-block instead of blocking it, so that legitimate test mail isn't lost to a false
-positive while the threshold is being tuned. Recipient validation (1) and the
+**The allowance (3) currently runs in monitoring mode.** It logs what it would
+hold instead of holding it, while API keys are rolled out. When enforced, mail
+past the allowance is not stored; the inbox receives a short notice naming the
+sender's domain and how to get a free key. Recipient validation (1) and the
 sender blocklist (2) do reject mail.
 
 The worker source code is fully auditable:
@@ -182,7 +185,7 @@ We will acknowledge receipt within 48 hours and aim to resolve critical issues w
 | Malformed recipient addresses | Validated at the worker and in the read API; only `[a-z0-9._+-]` names up to 64 characters are accepted |
 | Supply chain attack via Action | SHA pinning documented; worker source is auditable |
 | OTP theft | 30-min TTL limits exposure window; the worker never logs codes or subject lines; on the free tier they're accessible to whoever knows the inbox name |
-| Spam and registration farming | Mail from platforms whose codes were being farmed is rejected outright. An hourly cap on distinct inboxes per sending domain also runs, in monitoring mode while being tuned; see Edge processing |
+| Spam and registration farming | Mail from platforms whose codes were being farmed is rejected outright. A keyless allowance of 5 different inboxes a day per sender also runs, in monitoring mode while API keys roll out; see Edge processing |
 | Shared domain blocklist | Free tier risk documented; Workspaces use a domain dedicated to your team |
 
 ---

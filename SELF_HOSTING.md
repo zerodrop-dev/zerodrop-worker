@@ -51,7 +51,10 @@ npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
 # paste your Upstash Redis REST token when prompted
 
 npx wrangler secret put CAP_ALLOWLIST
-# optional: comma-separated sender domains exempt from the hourly cap
+# optional: comma-separated sender domains exempt from the keyless allowance
+
+npx wrangler secret put ALLOWLIST_UNTIL
+# optional: a date (YYYY-MM-DD, UTC) after which CAP_ALLOWLIST stops applying
 ```
 
 These are stored as encrypted secrets in Cloudflare — never in code or config files.

@@ -50,22 +50,27 @@ function extractOtp(bodyText, plainTextParsed) {
 }
 
 // ============================================
-// SENDER-DOMAIN CAP
+// KEYLESS ALLOWANCE
 // ============================================
-// Caps how many DISTINCT inboxes one sender domain can reach per hour.
-// Legitimate CI sends from the tester's own app domain to a handful of
-// inboxes; registration farming sends from a big platform to a fresh inbox
-// per fake account. Week of Sep 15-22: every legitimate sender reached 1
-// inbox/hour; deepseek.com reached 126.
-//   "shadow"  — count and log "would block", store the email anyway (current)
-//   "enforce" — reject mail past the threshold
-const CAP_MODE = "shadow";
-const CAP_PER_HOUR = 20;
+// Without an API key, one sender can reach at most ALLOWANCE_PER_DAY distinct
+// inboxes per UTC day. Farming needs a fresh inbox for every fake account, so
+// it runs out at once; a developer testing their own app stays under it or
+// gets a free key, and inboxes under a key's namespace (k7x2-...) aren't
+// counted. Counted per sending domain, or per full address for consumer
+// mailbox providers. Replaced the hourly cap (20 an hour, shadow mode) on
+// Oct 13, 2026: farming spread thinly across hours never tripped it.
+//   "shadow"  — count and log "would hold", store the email anyway (current)
+//   "enforce" — hold mail past the allowance: store a notice in its place
+const ALLOWANCE_MODE = "shadow";
+const ALLOWANCE_PER_DAY = 5;
 
-// Customers exempt from the cap, so their parallel CI suites are never capped,
-// come from the CAP_ALLOWLIST secret: comma-separated parent domains. The list
-// is never written here, because this repo is public and it names customers.
+// Senders exempt from the allowance (the grace period for integrations that
+// predate API keys) come from the CAP_ALLOWLIST secret: comma-separated parent
+// domains. The list is never written here, because this repo is public and it
+// names customers. The optional ALLOWLIST_UNTIL secret (YYYY-MM-DD) ends the
+// exemption automatically after that UTC date.
 //   npx wrangler secret put CAP_ALLOWLIST
+//   npx wrangler secret put ALLOWLIST_UNTIL
 // Consumer mailbox domains (gmail.com, posteo.com, ...) don't belong in it:
 // allowlisting one would exempt everyone who uses that provider.
 function domainSet(value) {
@@ -75,6 +80,59 @@ function domainSet(value) {
       .split(/[\s,]+/)
       .filter(Boolean)
   );
+}
+
+function allowlisted(env, domain) {
+  if (!domain) return false;
+  const until = String(env.ALLOWLIST_UNTIL || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(until) && new Date().toISOString().slice(0, 10) > until) {
+    return false;
+  }
+  return domainSet(env.CAP_ALLOWLIST).has(domain);
+}
+
+// ============================================
+// ACCOUNT NAMESPACES
+// ============================================
+// A free API key such as zd_k7x2_... makes the SDKs name inboxes
+// k7x2-swift-x7k29ab. A namespace is 4 characters with at least one letter and
+// one digit, so it never matches the adjective prefixes (dark-, void-, ...)
+// that names get without a key. The dashboard registers each namespace as
+// ns:{namespace} in Redis. Mail to a registered namespace belongs to a known
+// account and isn't counted against the allowance; who may READ it is enforced
+// by the read API.
+const NAMESPACE_PREFIX = /^([a-z0-9]{4})-/;
+
+function namespaceOf(inboxName) {
+  const m = NAMESPACE_PREFIX.exec(inboxName);
+  if (!m) return null;
+  const ns = m[1];
+  return /[a-z]/.test(ns) && /[0-9]/.test(ns) ? ns : null;
+}
+
+// What a held inbox receives instead of the email, so a test that waits for
+// mail fails with the reason rather than a timeout. Names the sender's domain,
+// never anything from the held message.
+function noticePayload(to, domain) {
+  const text =
+    `ZeroDrop held an email from ${domain || "this sender"} to this inbox.\n\n` +
+    `Without an API key, one sender can reach ${ALLOWANCE_PER_DAY} different inboxes a day, ` +
+    `and this sender passed that today. Get a free key at https://zerodrop.dev/keys and set ` +
+    `ZERODROP_API_KEY: inboxes created with a key aren't limited.\n`;
+  const subject = "ZeroDrop held an email: daily limit without an API key";
+  return {
+    id: crypto.randomUUID(),
+    from: "notice@zerodrop.dev",
+    to,
+    subject,
+    receivedAt: new Date().toISOString(),
+    raw:
+      `From: ZeroDrop <notice@zerodrop.dev>\r\nTo: ${to}\r\nSubject: ${subject}\r\n` +
+      `Content-Type: text/plain; charset=utf-8\r\n\r\n${text.replace(/\n/g, "\r\n")}`,
+    otp: null,
+    magicLink: null,
+    held: true,
+  };
 }
 
 // Collapse subdomains to the parent: sc.mail.deepseek.com -> deepseek.com,
@@ -90,9 +148,9 @@ function parentDomain(host) {
 }
 
 // Consumer mailbox providers are shared by millions of unrelated people, so
-// for them the cap counts per full sender ADDRESS, not per domain: one person
-// hitting 21 inboxes an hour is still caught; 1,000 Gmail users sending one
-// email each never collide.
+// for them the allowance counts per full sender ADDRESS, not per domain: one
+// person reaching 6 inboxes a day is still counted; 1,000 Gmail users sending
+// one email each never collide.
 const CONSUMER_MAILBOX = new Set([
   "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
   "yahoo.com", "icloud.com", "me.com", "aol.com", "proton.me",
@@ -108,8 +166,9 @@ function senderAddress(headerFrom, envelopeFrom) {
   return ((m ? m[1] : envelopeFrom) || "").toLowerCase();
 }
 
-// Returns { domain, identity }: domain for the allowlist, identity for the
-// cap counter (the full address for consumer mailboxes, else the domain).
+// Returns { domain, identity }: domain for the allowlist and blocklist,
+// identity for the allowance counter (the full address for consumer
+// mailboxes, else the domain).
 function capIdentity(headerFrom, envelopeFrom) {
   const addr = senderAddress(headerFrom, envelopeFrom);
   const domain = parentDomain(addr.split("@").pop());
@@ -162,47 +221,65 @@ export default {
     }
 
     // ============================================
-    // SENDER-DOMAIN CAP CHECK
+    // KEYLESS ALLOWANCE CHECK
     // ============================================
-    // capKey is only set when the sender is subject to the cap; the inbox is
-    // added to the hourly set in the same transaction that stores the email,
-    // so the set holds admitted inboxes only. Fails open on Redis errors.
-    let capKey = null;
-    if (domain && !domainSet(env.CAP_ALLOWLIST).has(domain)) {
-      capKey = `cap:${identity}:${new Date().toISOString().slice(0, 13)}`;
+    // One round trip: is the inbox under a registered namespace, and how many
+    // distinct inboxes has this sender reached today? allowKey stays set only
+    // when the mail counts against the allowance; the inbox joins the day's
+    // set in the same transaction that stores the email, so the set holds
+    // admitted inboxes only. Fails open on Redis errors.
+    const ns = namespaceOf(inboxName);
+    let allowKey =
+      domain && !allowlisted(env, domain)
+        ? `allow:${identity}:${new Date().toISOString().slice(0, 10)}`
+        : null;
+    let held = false;
+    if (ns || allowKey) {
       try {
-        const capRes = await fetch(`${env.UPSTASH_REDIS_REST_URL}/pipeline`, {
+        const commands = [];
+        if (ns) commands.push(["EXISTS", `ns:${ns}`]);
+        if (allowKey) commands.push(["SISMEMBER", allowKey, inboxName], ["SCARD", allowKey]);
+        const checkRes = await fetch(`${env.UPSTASH_REDIS_REST_URL}/pipeline`, {
           method: "POST",
           headers: {
             Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
             "Content-Type": "application/json",
           },
-          body: JSON.stringify([
-            ["SISMEMBER", capKey, inboxName],
-            ["SCARD", capKey],
-          ]),
+          body: JSON.stringify(commands),
         });
-        const [member, card] = await capRes.json();
-        const known = member?.result === 1;
-        const count = Number(card?.result ?? 0);
-        if (!known && count >= CAP_PER_HOUR) {
-          if (CAP_MODE === "enforce") {
-            console.log(`[ZeroDrop] Cap blocked sender=${identity} inbox=${inboxName} distinct_this_hour=${count}`);
-            message.setReject("Too many recipients from this sender; try again later");
-            return;
+        const results = await checkRes.json();
+        let i = 0;
+        const registered = ns ? results[i++]?.result === 1 : false;
+        if (registered) {
+          allowKey = null; // a known account's inbox: not counted
+        } else if (allowKey) {
+          const known = results[i]?.result === 1;
+          const count = Number(results[i + 1]?.result ?? 0);
+          if (!known && count >= ALLOWANCE_PER_DAY) {
+            if (ALLOWANCE_MODE === "enforce") {
+              held = true;
+              console.log(`[ZeroDrop] Held sender=${identity} inbox=${inboxName} distinct_today=${count}`);
+            } else {
+              console.log(`[ZeroDrop] Allowance would hold (shadow) sender=${identity} inbox=${inboxName} distinct_today=${count}`);
+            }
           }
-          console.log(`[ZeroDrop] Cap would block (shadow) sender=${identity} inbox=${inboxName} distinct_this_hour=${count}`);
         }
-      } catch (capError) {
-        console.log(`[ZeroDrop] Cap check error — allowing email through: ${capError.message}`);
+      } catch (checkError) {
+        console.log(`[ZeroDrop] Allowance check error — allowing email through: ${checkError.message}`);
       }
+    }
+
+    if (held) {
+      // The email itself is never parsed or stored; the inbox gets the notice.
+      await store(env, inboxName, noticePayload(to, domain), null);
+      return;
     }
 
     // There is no content-based spam filter. A Workers AI classifier ran here
     // in monitoring mode until October 2026 and was removed: it flagged real
     // test mail as spam and missed most farmed codes. Abuse is handled by who
-    // sends the mail (the blocklist) and how widely (the cap), not by what it
-    // says.
+    // sends the mail (the blocklist) and how widely (the allowance), not by
+    // what it says.
 
     // ============================================
     // PARSE EMAIL
@@ -250,40 +327,42 @@ export default {
       magicLink,
     };
 
-    // ============================================
-    // PUSH TO REDIS — LPUSH + EXPIRE in one transaction
-    // ============================================
-    // Commands go in the request BODY, so the inbox name never becomes part of
-    // a URL. /multi-exec is atomic: the email can't be stored without its TTL,
-    // which is what makes the 30-minute retention promise hold.
-    // The stored value is byte-identical to before (an array-wrapped JSON
-    // string), so both read routes parse it unchanged.
-    const key = `inbox:${inboxName}`;
-    const response = await fetch(`${env.UPSTASH_REDIS_REST_URL}/multi-exec`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify([
-        ["LPUSH", key, JSON.stringify([JSON.stringify(emailPayload)])],
-        ["EXPIRE", key, "1800"],
-        // Record this inbox against the sender's hourly cap set (2h TTL
-        // covers the whole hour bucket).
-        ...(capKey ? [["SADD", capKey, inboxName], ["EXPIRE", capKey, "7200"]] : []),
-      ]),
-    });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Failed to store email: ${error}`);
-    }
-
-    const results = await response.json();
-    if (!Array.isArray(results) || results.some((r) => r && r.error)) {
-      throw new Error(`Redis transaction error: ${JSON.stringify(results)}`);
-    }
-
+    await store(env, inboxName, emailPayload, allowKey);
     console.log(`[ZeroDrop] Email from ${from} → inbox:${inboxName}`);
   },
 };
+
+// ============================================
+// STORE — one atomic transaction
+// ============================================
+// Commands go in the request BODY, so the inbox name never becomes part of a
+// URL. /multi-exec is atomic: the email can't be stored without its TTL, which
+// is what makes the 30-minute retention promise hold. The stored value is an
+// array-wrapped JSON string, as before, so both read routes parse it
+// unchanged. With allowKey, the inbox joins the sender's set for the day in
+// the same transaction (a 2-day TTL covers the whole UTC day).
+async function store(env, inboxName, payload, allowKey) {
+  const key = `inbox:${inboxName}`;
+  const response = await fetch(`${env.UPSTASH_REDIS_REST_URL}/multi-exec`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify([
+      ["LPUSH", key, JSON.stringify([JSON.stringify(payload)])],
+      ["EXPIRE", key, "1800"],
+      ...(allowKey ? [["SADD", allowKey, inboxName], ["EXPIRE", allowKey, "172800"]] : []),
+    ]),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to store email: ${error}`);
+  }
+
+  const results = await response.json();
+  if (!Array.isArray(results) || results.some((r) => r && r.error)) {
+    throw new Error(`Redis transaction error: ${JSON.stringify(results)}`);
+  }
+}
