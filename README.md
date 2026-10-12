@@ -9,7 +9,6 @@ Inbound email → Cloudflare Email Routing
                       ↓
               zerodrop-worker (this repo)
     recipient check · sender blocklist · hourly sender cap
-      Workers AI spam classification (monitoring mode)
                       ↓
               OTP + magic link extraction
                       ↓
@@ -26,9 +25,8 @@ Inbound email → Cloudflare Email Routing
 2. **Validates the recipient** — malformed inbox names are rejected
 3. **Rejects blocked senders** — a short list of platforms whose verification codes were being farmed through free inboxes
 4. **Checks an hourly cap** on distinct inboxes per sending domain (per address for consumer mailbox providers) — monitoring mode: logged, not enforced
-5. **Classifies spam** with Llama 3.1 on Cloudflare Workers AI — monitoring mode: the verdict is logged, no mail is dropped
-6. **Auto-extracts OTPs and magic links** at the edge, so your test suite gets `email.otp` and `email.magicLink` directly
-7. **Stores the email** in Upstash Redis — key `inbox:{name}`, TTL 1800s (30 min), written atomically with its expiry
+5. **Auto-extracts OTPs and magic links** at the edge, so your test suite gets `email.otp` and `email.magicLink` directly
+6. **Stores the email** in Upstash Redis — key `inbox:{name}`, TTL 1800s (30 min), written atomically with its expiry
 
 ---
 
@@ -42,7 +40,7 @@ Secrets are stored as Cloudflare Worker secrets — never in code or git history
 | `UPSTASH_REDIS_REST_TOKEN` | Upstash Redis REST token |
 | `CAP_ALLOWLIST` | Optional. Comma-separated sender domains exempt from the hourly cap |
 
-The `AI` binding is configured via `wrangler.jsonc` and uses Cloudflare's built-in Workers AI — no external API key needed.
+No other bindings are needed. The worker runs no AI model.
 
 ---
 

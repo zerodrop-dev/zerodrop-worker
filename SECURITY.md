@@ -52,14 +52,13 @@ data reaches Redis. The worker:
 2. Rejects mail from a short list of platforms whose verification codes were
    being farmed through free inboxes
 3. Checks the sender against an hourly cap on distinct inboxes per sending domain
-4. Runs Llama 3.1 spam classification (SPAM / LEGITIMATE) via Cloudflare Workers AI
-5. Extracts OTP codes and magic links from the plain-text body
-6. Stores the message under `inbox:{name}` with a 1800s TTL, atomically
+4. Extracts OTP codes and magic links from the plain-text body
+5. Stores the message under `inbox:{name}` with a 1800s TTL, atomically
 
-**Controls 3 and 4 currently run in monitoring mode.** They log what they would
+**The hourly cap (3) currently runs in monitoring mode.** It logs what it would
 block instead of blocking it, so that legitimate test mail isn't lost to a false
-positive while the thresholds and the classifier are being tuned. Recipient
-validation (1) and the sender blocklist (2) do reject mail.
+positive while the threshold is being tuned. Recipient validation (1) and the
+sender blocklist (2) do reject mail.
 
 The worker source code is fully auditable:
 → https://github.com/zerodrop-dev/zerodrop-worker
@@ -96,23 +95,11 @@ repository, your build environment, or your machine.
 
 ---
 
-## AI Spam Filter — Cloudflare Workers AI
+## No AI Processing
 
-ZeroDrop uses Llama 3.1 (8B instruct, `@cf/meta/llama-3.1-8b-instruct-fp8`) for
-spam classification via **Cloudflare Workers AI**. As noted above, the filter
-currently runs in monitoring mode: it classifies and logs, but does not drop mail.
-
-**Critical compliance note:** This model runs entirely within Cloudflare's infrastructure. Email content is **never sent to an external AI provider** (OpenAI, Anthropic, Groq, or any third party). The inference happens inside the same Cloudflare Worker that receives the email — no data leaves Cloudflare's network for AI processing.
-
-Cloudflare Workers AI specifics:
-- Inference runs on Cloudflare's global edge network
-- No data retention for model training
-- No external API calls
-- Compliant with Cloudflare's data processing terms
-
-This means ZeroDrop's AI processing does not require a separate Data Processing Agreement (DPA) beyond your existing Cloudflare terms of service.
-
-For teams under SOC2, GDPR, or HIPAA auditing: the spam filter processes only the email sender address and subject line — not the full body — to make a SPAM/LEGITIMATE classification. The full body is never sent to the AI model.
+ZeroDrop runs no AI model on your email. Earlier versions ran a Llama 3.1 spam
+classifier on Cloudflare Workers AI, in monitoring mode, which saw each message's
+sender and subject line but never the body. It was removed in October 2026.
 
 ---
 
@@ -195,8 +182,7 @@ We will acknowledge receipt within 48 hours and aim to resolve critical issues w
 | Malformed recipient addresses | Validated at the worker and in the read API; only `[a-z0-9._+-]` names up to 64 characters are accepted |
 | Supply chain attack via Action | SHA pinning documented; worker source is auditable |
 | OTP theft | 30-min TTL limits exposure window; the worker never logs codes or subject lines; on the free tier they're accessible to whoever knows the inbox name |
-| Spam and registration farming | Mail from platforms whose codes were being farmed is rejected outright. An hourly cap on distinct inboxes per sending domain and Llama 3.1 classification also run, both in monitoring mode while being tuned; see Edge processing |
-| AI data leak | Cloudflare Workers AI — inference runs on Cloudflare's network, no external AI provider |
+| Spam and registration farming | Mail from platforms whose codes were being farmed is rejected outright. An hourly cap on distinct inboxes per sending domain also runs, in monitoring mode while being tuned; see Edge processing |
 | Shared domain blocklist | Free tier risk documented; Workspaces use a domain dedicated to your team |
 
 ---

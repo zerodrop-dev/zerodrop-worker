@@ -37,9 +37,6 @@ Copy the example config and update with your account details:
   "workers_dev": true,
   "observability": {
     "enabled": true
-  },
-  "ai": {
-    "binding": "AI"
   }
 }
 ```
@@ -52,6 +49,9 @@ npx wrangler secret put UPSTASH_REDIS_REST_URL
 
 npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
 # paste your Upstash Redis REST token when prompted
+
+npx wrangler secret put CAP_ALLOWLIST
+# optional: comma-separated sender domains exempt from the hourly cap
 ```
 
 These are stored as encrypted secrets in Cloudflare — never in code or config files.
@@ -102,33 +102,12 @@ The worker uses Upstash's REST API for Redis operations. If you want to use a di
 
 ---
 
-## Disabling the AI spam filter
-
-If you want to skip Llama 3.1 spam filtering (e.g. air-gapped environments without Workers AI access), remove or comment out the AI filter block in `src/index.js`:
-
-```javascript
-// Remove or comment out this entire block:
-// ============================================
-// AI SPAM FILTER
-// ============================================
-// try {
-//   const classification = await env.AI.run(...)
-//   ...
-// }
-```
-
-All emails will pass through without spam filtering.
-
----
-
 ## Architecture when self-hosted
 
 ```
 Inbound email → Cloudflare Email Routing (your domain)
                       ↓
               zerodrop-worker (your Cloudflare account)
-                      ↓
-         Cloudflare Workers AI (your account, optional)
                       ↓
               Your Redis instance
                       ↓
@@ -143,7 +122,6 @@ No data leaves your Cloudflare account or your Redis instance.
 
 - **Cloudflare Workers** — free tier includes 100,000 requests/day
 - **Cloudflare Email Routing** — free
-- **Cloudflare Workers AI** — free tier includes 10,000 neurons/day
 - **Upstash Redis** — free tier includes 10,000 commands/day
 
 For most CI pipelines, self-hosting runs entirely within free tiers.

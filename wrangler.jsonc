@@ -7,8 +7,5 @@
   "workers_dev": true,
   "observability": {
     "enabled": true
-  },
-  "ai": {
-    "binding": "AI"
   }
 }
