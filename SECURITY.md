@@ -28,10 +28,17 @@ don't extract or index those, but they are part of the payload until the TTL
 deletes it.
 
 ### Logs
-Cloudflare retains this worker's logs for 7 days. They record the sender,
-recipient, subject line, and whether an OTP or magic link was found — **never
-the code or link itself**. Our dashboard host and Cloudflare also keep standard
-request logs (IP address, user agent, request path) for up to 7 days.
+Cloudflare retains this worker's logs for 7 days. They record the sender, the
+recipient, the message size, and whether an OTP or magic link was found —
+**never the subject line, the body, or the code or link itself**. Subject lines
+are left out because many services put the one-time code in them.
+
+Cloudflare's own Email Routing activity log, in our Cloudflare dashboard,
+separately lists each message's sender, recipient and subject line, so a code
+that a service puts in its subject line does appear there.
+
+Our dashboard host and Cloudflare also keep standard request logs (IP address,
+user agent, request path) for up to 7 days.
 
 ### Retention
 All inbox data is stored in Upstash Redis with a **30-minute TTL**. The email and
@@ -42,15 +49,17 @@ stored without its deletion timer.
 Processing happens entirely inside the Cloudflare Worker at the edge — before any
 data reaches Redis. The worker:
 1. Validates the recipient address; malformed addresses are rejected
-2. Checks the sender against an hourly cap on distinct inboxes per sending domain
-3. Runs Llama 3.1 spam classification (SPAM / LEGITIMATE) via Cloudflare Workers AI
-4. Extracts OTP codes and magic links from the plain-text body
-5. Stores the message under `inbox:{name}` with a 1800s TTL, atomically
+2. Rejects mail from a short list of platforms whose verification codes were
+   being farmed through free inboxes
+3. Checks the sender against an hourly cap on distinct inboxes per sending domain
+4. Runs Llama 3.1 spam classification (SPAM / LEGITIMATE) via Cloudflare Workers AI
+5. Extracts OTP codes and magic links from the plain-text body
+6. Stores the message under `inbox:{name}` with a 1800s TTL, atomically
 
-**Controls 2 and 3 currently run in monitoring mode.** They log what they would
+**Controls 3 and 4 currently run in monitoring mode.** They log what they would
 block instead of blocking it, so that legitimate test mail isn't lost to a false
 positive while the thresholds and the classifier are being tuned. Recipient
-validation (1) does reject mail.
+validation (1) and the sender blocklist (2) do reject mail.
 
 The worker source code is fully auditable:
 → https://github.com/zerodrop-dev/zerodrop-worker
@@ -62,8 +71,8 @@ code", and similar) are preferred; a bare number is used only as a fallback, and
 values that look like years, prices or percentages are skipped. They are stored
 alongside the raw email payload in Redis and expire after 30 minutes with the
 rest of the inbox data. Extraction happens entirely within Cloudflare's
-infrastructure — no external service is called, and codes are never written to
-logs.
+infrastructure — no external service is called, and the worker never writes
+codes to its logs (see Logs).
 
 ---
 
@@ -185,8 +194,8 @@ We will acknowledge receipt within 48 hours and aim to resolve critical issues w
 | Data persistence | Hard Redis TTL, written atomically with the message — data cannot persist beyond 30 minutes regardless of application logic |
 | Malformed recipient addresses | Validated at the worker and in the read API; only `[a-z0-9._+-]` names up to 64 characters are accepted |
 | Supply chain attack via Action | SHA pinning documented; worker source is auditable |
-| OTP theft | 30-min TTL limits exposure window; codes are never written to logs; on the free tier they're accessible to whoever knows the inbox name |
-| Spam and registration farming | Hourly cap on distinct inboxes per sending domain, plus Llama 3.1 classification — both in monitoring mode while being tuned; see Edge processing |
+| OTP theft | 30-min TTL limits exposure window; the worker never logs codes or subject lines; on the free tier they're accessible to whoever knows the inbox name |
+| Spam and registration farming | Mail from platforms whose codes were being farmed is rejected outright. An hourly cap on distinct inboxes per sending domain and Llama 3.1 classification also run, both in monitoring mode while being tuned; see Edge processing |
 | AI data leak | Cloudflare Workers AI — inference runs on Cloudflare's network, no external AI provider |
 | Shared domain blocklist | Free tier risk documented; Workspaces use a domain dedicated to your team |
 

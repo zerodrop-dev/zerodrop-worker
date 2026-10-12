@@ -69,18 +69,23 @@ function extractOtp(bodyText, plainTextParsed) {
 const CAP_MODE = "shadow";
 const CAP_PER_HOUR = 20;
 
-// Integrated users from USERS.md — exempt so parallel CI suites are never
-// capped. Parent domains only. posteo.com deliberately NOT listed: it's a
-// consumer mailbox provider, so allowlisting it would exempt anyone.
-const CAP_ALLOWLIST = new Set([
-  "khangames.mn",
-  "dev.krd",
-  "salus.co.uk",
-  "evalubox.com",
-]);
+// Customers exempt from the cap, so their parallel CI suites are never capped,
+// come from the CAP_ALLOWLIST secret: comma-separated parent domains. The list
+// is never written here, because this repo is public and it names customers.
+//   npx wrangler secret put CAP_ALLOWLIST
+// Consumer mailbox domains (gmail.com, posteo.com, ...) don't belong in it:
+// allowlisting one would exempt everyone who uses that provider.
+function domainSet(value) {
+  return new Set(
+    String(value || "")
+      .toLowerCase()
+      .split(/[\s,]+/)
+      .filter(Boolean)
+  );
+}
 
 // Collapse subdomains to the parent: sc.mail.deepseek.com -> deepseek.com,
-// em2795.salus.co.uk -> salus.co.uk. Heuristic, not a full public-suffix list.
+// mail.example.co.uk -> example.co.uk. Heuristic, not a full public-suffix list.
 const MULTI_PART_SLD = new Set(["co", "com", "org", "net", "ac", "gov", "edu"]);
 function parentDomain(host) {
   const labels = String(host).toLowerCase().replace(/\.$/, "").split(".").filter(Boolean);
@@ -118,6 +123,26 @@ function capIdentity(headerFrom, envelopeFrom) {
   return { domain, identity: CONSUMER_MAILBOX.has(domain) ? addr : domain };
 }
 
+// ============================================
+// SENDER BLOCKLIST
+// ============================================
+// Platforms whose verification codes were being farmed through free inboxes:
+// one fresh inbox per signup, spread thinly enough that the hourly cap never
+// saw a burst. Nobody testing their own app needs mail from these senders, so
+// it is rejected outright. Matched on the parent domain of the header From,
+// so sc.mail.deepseek.com counts as deepseek.com. Public on purpose: what we
+// refuse can be public; who we exempt cannot.
+const SENDER_BLOCKLIST = new Set([
+  "deepseek.com",
+  "eazo.ai",
+  "miraimindjp.com",
+  "platoapp.com",
+  "reddit.com",
+  "runbios.ai",
+  "superprofile.bio",
+  "x.ai",
+]);
+
 // Header values are sender-controlled and go into an LLM prompt: flatten and
 // truncate so they can't restructure the prompt.
 function promptSafe(value) {
@@ -138,15 +163,25 @@ export default {
       return;
     }
 
+    const { domain, identity } = capIdentity(message.headers.get("from"), from);
+
+    // ============================================
+    // SENDER BLOCKLIST CHECK
+    // ============================================
+    if (SENDER_BLOCKLIST.has(domain)) {
+      console.log(`[ZeroDrop] Blocked sender=${domain} inbox=${inboxName}`);
+      message.setReject("Mail from this sender is not accepted");
+      return;
+    }
+
     // ============================================
     // SENDER-DOMAIN CAP CHECK
     // ============================================
     // capKey is only set when the sender is subject to the cap; the inbox is
     // added to the hourly set in the same transaction that stores the email,
     // so the set holds admitted inboxes only. Fails open on Redis errors.
-    const { domain, identity } = capIdentity(message.headers.get("from"), from);
     let capKey = null;
-    if (domain && !CAP_ALLOWLIST.has(domain)) {
+    if (domain && !domainSet(env.CAP_ALLOWLIST).has(domain)) {
       capKey = `cap:${identity}:${new Date().toISOString().slice(0, 13)}`;
       try {
         const capRes = await fetch(`${env.UPSTASH_REDIS_REST_URL}/pipeline`, {
@@ -202,11 +237,13 @@ Reply with only SPAM or LEGITIMATE.`
       );
       const result = classification?.response?.trim().toUpperCase();
       if (result === "SPAM") {
+        // Never log the subject line: many services put the one-time code in
+        // it ("123456 is your ... code"), and Worker logs are kept for 7 days.
         if (SPAM_FILTER_MODE === "enforce") {
-          console.log(`[ZeroDrop] Dropped spam from ${from} — subject: ${subject}`);
+          console.log(`[ZeroDrop] Dropped spam sender=${domain} inbox=${inboxName}`);
           return; // Silent drop — never hits Redis
         }
-        console.log(`[ZeroDrop] Spam verdict (shadow, NOT dropped) from ${from} — subject: ${subject}`);
+        console.log(`[ZeroDrop] Spam verdict (shadow, NOT dropped) sender=${domain} inbox=${inboxName}`);
       }
     } catch (aiError) {
       // If AI fails, allow the email through
