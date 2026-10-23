@@ -51,13 +51,19 @@ npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
 # paste your Upstash Redis REST token when prompted
 
 npx wrangler secret put CAP_ALLOWLIST
-# optional: comma-separated sender domains exempt from the keyless allowance
+# optional: comma-separated parent domains exempt from the keyless allowance
+# (example.com covers noreply@mail.example.com; mail.example.com matches nothing)
 
 npx wrangler secret put ALLOWLIST_UNTIL
 # optional: a date (YYYY-MM-DD, UTC) after which CAP_ALLOWLIST stops applying
+
+npx wrangler secret put ALLOWANCE_MODE
+# optional: "off" to stop counting, "shadow" to log only
 ```
 
 These are stored as encrypted secrets in Cloudflare — never in code or config files.
+
+**The keyless allowance doesn't apply on your own domain.** The worker counts only mail to `zerodrop-sandbox.online`, ZeroDrop's shared domain, so `CAP_ALLOWLIST`, `ALLOWLIST_UNTIL` and `ALLOWANCE_MODE` don't matter on a self-hosted instance.
 
 ### 4. Deploy
 
@@ -87,7 +93,7 @@ const mail = new ZeroDrop(undefined, {
 });
 ```
 
-Or set the environment variable:
+The other SDKs take a base URL option the same way. The MCP server reads it from an environment variable instead:
 
 ```bash
 ZERODROP_BASE_URL=https://your-dashboard.yourdomain.com
@@ -99,7 +105,7 @@ ZERODROP_BASE_URL=https://your-dashboard.yourdomain.com
 
 The worker uses Upstash's REST API for Redis operations. If you want to use a different Redis provider:
 
-1. Any Redis-compatible REST API works — the worker uses simple `lpush`, `expire`, and `lrange` commands
+1. Any REST API compatible with Upstash's works — the worker sends `GET` and `EVAL` (a short Lua script that counts the keyless allowance) to `/pipeline`, and `LPUSH` and `EXPIRE` to `/multi-exec`
 2. Update the fetch URLs in `src/index.js` to point to your Redis endpoint
 3. Set your auth token via `wrangler secret put`
 

@@ -57,12 +57,48 @@ function extractOtp(bodyText, plainTextParsed) {
 // it runs out at once; a developer testing their own app stays under it or
 // gets a free key, and inboxes under a key's namespace (k7x2-...) aren't
 // counted. Counted per sending domain, or per full address for consumer
-// mailbox providers. Replaced the hourly cap (20 an hour, shadow mode) on
-// Oct 13, 2026: farming spread thinly across hours never tripped it.
-//   "shadow"  — count and log "would hold", store the email anyway (current)
-//   "enforce" — hold mail past the allowance: store a notice in its place
-const ALLOWANCE_MODE = "shadow";
+// mailbox providers. Only mail to the shared sandbox domain is counted: a
+// Workspace's own domain, or a self-hosted instance's, never is.
+// Replaced the hourly cap (20 an hour, shadow mode) on
+// Oct 13, 2026: farming spread thinly across hours never tripped it. It ran in
+// shadow mode from then while API keys rolled out, and is now enforced.
+//
+// The optional ALLOWANCE_MODE secret overrides the mode without a code change:
+//   unset     — enforce: mail past the allowance is held. It is neither parsed
+//               nor stored, and the inbox gets a notice in its place
+//   "shadow"  — count and log "would hold", but store the email anyway (the
+//               rollback switch)
+//   "off"     — don't count at all
+//   npx wrangler secret put ALLOWANCE_MODE       then type: shadow
+//   npx wrangler secret delete ALLOWANCE_MODE    back to enforce
 const ALLOWANCE_PER_DAY = 5;
+const SANDBOX_DOMAIN = "zerodrop-sandbox.online";
+
+function allowanceMode(env) {
+  const mode = String(env.ALLOWANCE_MODE || "").trim().toLowerCase();
+  return mode === "shadow" || mode === "off" ? mode : "enforce";
+}
+
+// Counting runs as one Lua script, so the check and the add are atomic: mail
+// arriving at the same moment can't all see room under the allowance and all
+// get in. KEYS[1] is the sender's set of inboxes for the day (expires after 2
+// days); ARGV[1] the inbox, ARGV[2] the allowance, ARGV[3] "1" to admit mail
+// past it anyway (shadow mode). Returns {status, inboxes the sender reached
+// today before this one}:
+//    0  an inbox the sender already reached today: admitted
+//    1  a new inbox within the allowance: admitted and counted
+//    2  past the allowance, admitted anyway (shadow)
+//   -1  past the allowance: hold. A held inbox doesn't join the set
+const COUNT_SCRIPT = `
+local n = redis.call('SCARD', KEYS[1])
+if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return {0, n} end
+local over = n >= tonumber(ARGV[2])
+if over and ARGV[3] ~= '1' then return {-1, n} end
+redis.call('SADD', KEYS[1], ARGV[1])
+redis.call('EXPIRE', KEYS[1], 172800)
+if over then return {2, n} end
+return {1, n}
+`;
 
 // Senders exempt from the allowance (the grace period for integrations that
 // predate API keys) come from the CAP_ALLOWLIST secret: comma-separated parent
@@ -98,10 +134,17 @@ function allowlisted(env, domain) {
 // k7x2-swift-x7k29ab. A namespace is 4 characters with at least one letter and
 // one digit, so it never matches the adjective prefixes (dark-, void-, ...)
 // that names get without a key. The dashboard registers each namespace as
-// ns:{namespace} in Redis. Mail to a registered namespace belongs to a known
-// account and isn't counted against the allowance; who may READ it is enforced
-// by the read API.
+// ns:{namespace} in Redis, holding the account id (a UUID) while the account
+// is active, "suspended" while it's suspended and "retired" once it's deleted
+// (src/lib/accounts.js in the dashboard repo). Who may READ an inbox is
+// enforced by the read API; here the value decides what happens to the mail:
+//   no value    — no account: counted like any keyless inbox
+//   account id  — a known account's inbox: stored, not counted
+//   other       — suspended or retired: rejected. The read API returns such
+//                 inboxes to nobody, so storing the mail would only keep
+//                 unreadable mail for 30 minutes
 const NAMESPACE_PREFIX = /^([a-z0-9]{4})-/;
+const ACCOUNT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function namespaceOf(inboxName) {
   const m = NAMESPACE_PREFIX.exec(inboxName);
@@ -110,15 +153,37 @@ function namespaceOf(inboxName) {
   return /[a-z]/.test(ns) && /[0-9]/.test(ns) ? ns : null;
 }
 
+// "unregistered", "active" or "closed", from the raw value of ns:{namespace}.
+function namespaceState(value) {
+  if (!value) return "unregistered";
+  return typeof value === "string" && ACCOUNT_ID.test(value) ? "active" : "closed";
+}
+
 // What a held inbox receives instead of the email, so a test that waits for
 // mail fails with the reason rather than a timeout. Names the sender's domain,
-// never anything from the held message.
-function noticePayload(to, domain) {
-  const text =
-    `ZeroDrop held an email from ${domain || "this sender"} to this inbox.\n\n` +
+// never anything from the held message: for consumer mailbox providers, where
+// the allowance counts per address, it says "an address at gmail.com" rather
+// than the address. `held: true` marks it for the clients, which stop waiting
+// and raise an error carrying `reason`, the same text on one line.
+//
+// The domain comes from the From header, which the sender writes, so it is
+// named only when it is a plain host name. Otherwise a header such as
+// <a@x.https://evil.example/keys> would put "https://evil.example/keys" into
+// every client's error message.
+const HOST_NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/;
+
+function noticePayload(to, domain, perAddress) {
+  const named = HOST_NAME.test(domain || "") ? domain : null;
+  const sender = named ? (perAddress ? `an address at ${named}` : named) : "this sender";
+  const paragraphs = [
+    `ZeroDrop held an email from ${sender} to this inbox. The email was not stored.`,
     `Without an API key, one sender can reach ${ALLOWANCE_PER_DAY} different inboxes a day, ` +
-    `and this sender passed that today. Get a free key at https://zerodrop.dev/keys and set ` +
-    `ZERODROP_API_KEY: inboxes created with a key aren't limited.\n`;
+      `and this sender reached that today.`,
+    `Get a free key at https://zerodrop.dev/keys and set it as ZERODROP_API_KEY. ZeroDrop's ` +
+      `clients then start new inbox names with your key's prefix, and mail to those inboxes ` +
+      `isn't limited.`,
+  ];
+  const text = `${paragraphs.join("\n\n")}\n`;
   const subject = "ZeroDrop held an email: daily limit without an API key";
   return {
     id: crypto.randomUUID(),
@@ -132,6 +197,7 @@ function noticePayload(to, domain) {
     otp: null,
     magicLink: null,
     held: true,
+    reason: paragraphs.join(" "),
   };
 }
 
@@ -221,57 +287,54 @@ export default {
     }
 
     // ============================================
-    // KEYLESS ALLOWANCE CHECK
+    // ACCOUNT PREFIX AND KEYLESS ALLOWANCE CHECK
     // ============================================
-    // One round trip: is the inbox under a registered namespace, and how many
-    // distinct inboxes has this sender reached today? allowKey stays set only
-    // when the mail counts against the allowance; the inbox joins the day's
-    // set in the same transaction that stores the email, so the set holds
-    // admitted inboxes only. Fails open on Redis errors.
+    // First, for a prefixed name, what ns:{namespace} holds: an active
+    // account's inbox isn't counted, and a closed one's mail is rejected.
+    // Then, if the mail counts against the allowance, the count script
+    // (COUNT_SCRIPT) admits the inbox or says to hold it. Fails open: if Redis
+    // can't answer, the email is stored and nothing is held or rejected.
+    const mode = allowanceMode(env);
     const ns = namespaceOf(inboxName);
+    const toSandbox = String(to).split("@").pop().toLowerCase() === SANDBOX_DOMAIN;
     let allowKey =
-      domain && !allowlisted(env, domain)
+      mode !== "off" && toSandbox && domain && !allowlisted(env, domain)
         ? `allow:${identity}:${new Date().toISOString().slice(0, 10)}`
         : null;
     let held = false;
-    if (ns || allowKey) {
-      try {
-        const commands = [];
-        if (ns) commands.push(["EXISTS", `ns:${ns}`]);
-        if (allowKey) commands.push(["SISMEMBER", allowKey, inboxName], ["SCARD", allowKey]);
-        const checkRes = await fetch(`${env.UPSTASH_REDIS_REST_URL}/pipeline`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(commands),
-        });
-        const results = await checkRes.json();
-        let i = 0;
-        const registered = ns ? results[i++]?.result === 1 : false;
-        if (registered) {
-          allowKey = null; // a known account's inbox: not counted
-        } else if (allowKey) {
-          const known = results[i]?.result === 1;
-          const count = Number(results[i + 1]?.result ?? 0);
-          if (!known && count >= ALLOWANCE_PER_DAY) {
-            if (ALLOWANCE_MODE === "enforce") {
-              held = true;
-              console.log(`[ZeroDrop] Held sender=${identity} inbox=${inboxName} distinct_today=${count}`);
-            } else {
-              console.log(`[ZeroDrop] Allowance would hold (shadow) sender=${identity} inbox=${inboxName} distinct_today=${count}`);
-            }
-          }
-        }
-      } catch (checkError) {
-        console.log(`[ZeroDrop] Allowance check error — allowing email through: ${checkError.message}`);
+    let closed = false;
+    try {
+      if (ns) {
+        const [owner] = await redis(env, "/pipeline", [["GET", `ns:${ns}`]]);
+        const state = namespaceState(owner);
+        closed = state === "closed";
+        if (state !== "unregistered") allowKey = null; // an account's inbox: not counted
       }
+      if (allowKey) {
+        const [[status, before]] = await redis(env, "/pipeline", [
+          ["EVAL", COUNT_SCRIPT, "1", allowKey, inboxName, String(ALLOWANCE_PER_DAY), mode === "shadow" ? "1" : "0"],
+        ]);
+        if (![-1, 0, 1, 2].includes(status)) throw new Error("unexpected reply from the count script");
+        if (status === -1) {
+          held = true;
+          console.log(`[ZeroDrop] Held sender=${identity} inbox=${inboxName} distinct_today=${before}`);
+        } else if (status === 2) {
+          console.log(`[ZeroDrop] Allowance would hold (shadow) sender=${identity} inbox=${inboxName} distinct_today=${before}`);
+        }
+      }
+    } catch (checkError) {
+      console.log(`[ZeroDrop] Allowance check error — allowing email through: ${checkError.message}`);
+    }
+
+    if (closed) {
+      console.log(`[ZeroDrop] Rejected mail to a closed prefix ns=${ns} sender=${domain}`);
+      message.setReject("This inbox is closed");
+      return;
     }
 
     if (held) {
       // The email itself is never parsed or stored; the inbox gets the notice.
-      await store(env, inboxName, noticePayload(to, domain), null);
+      await store(env, inboxName, noticePayload(to, domain, identity !== domain));
       return;
     }
 
@@ -327,21 +390,41 @@ export default {
       magicLink,
     };
 
-    await store(env, inboxName, emailPayload, allowKey);
+    await store(env, inboxName, emailPayload);
     console.log(`[ZeroDrop] Email from ${from} → inbox:${inboxName}`);
   },
 };
 
 // ============================================
-// STORE — one atomic transaction
+// REDIS — Upstash's REST API
 // ============================================
 // Commands go in the request BODY, so the inbox name never becomes part of a
-// URL. /multi-exec is atomic: the email can't be stored without its TTL, which
-// is what makes the 30-minute retention promise hold. The stored value is an
+// URL. Returns each command's result, or throws if the request or any command
+// failed.
+async function redis(env, path, commands) {
+  const response = await fetch(`${env.UPSTASH_REDIS_REST_URL}${path}`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(commands),
+  });
+  const replies = await response.json();
+  if (!Array.isArray(replies) || replies.length !== commands.length || replies.some((r) => !r || r.error)) {
+    throw new Error(`unexpected reply from Redis (HTTP ${response.status})`);
+  }
+  return replies.map((r) => r.result);
+}
+
+// ============================================
+// STORE — one atomic transaction
+// ============================================
+// /multi-exec is atomic: the email can't be stored without its TTL, which is
+// what makes the 30-minute retention promise hold. The stored value is an
 // array-wrapped JSON string, as before, so both read routes parse it
-// unchanged. With allowKey, the inbox joins the sender's set for the day in
-// the same transaction (a 2-day TTL covers the whole UTC day).
-async function store(env, inboxName, payload, allowKey) {
+// unchanged.
+async function store(env, inboxName, payload) {
   const key = `inbox:${inboxName}`;
   const response = await fetch(`${env.UPSTASH_REDIS_REST_URL}/multi-exec`, {
     method: "POST",
@@ -352,7 +435,6 @@ async function store(env, inboxName, payload, allowKey) {
     body: JSON.stringify([
       ["LPUSH", key, JSON.stringify([JSON.stringify(payload)])],
       ["EXPIRE", key, "1800"],
-      ...(allowKey ? [["SADD", allowKey, inboxName], ["EXPIRE", allowKey, "172800"]] : []),
     ]),
   });
 
