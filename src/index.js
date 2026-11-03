@@ -1,3 +1,5 @@
+import { storedForm } from "./encryption.js";
+
 // Inbox names come from the recipient's local part, which the SENDER controls.
 // Accept only what real inboxes use: lowercase letters, digits, and . _ + -
 // (64 = RFC 5321 local-part limit). Must match src/lib/inbox-name.js in the
@@ -159,6 +161,95 @@ function namespaceState(value) {
   return typeof value === "string" && ACCOUNT_ID.test(value) ? "active" : "closed";
 }
 
+function isNamespace(value) {
+  return typeof value === "string" && /^[a-z0-9]{4}$/.test(value) && /[a-z]/.test(value) && /[0-9]/.test(value);
+}
+
+// ============================================
+// WORKSPACES: CUSTOM DOMAINS AND RETENTION
+// ============================================
+// A Workspace is an account with its own receiving domain, its own retention,
+// or both. They're set by hand with scripts/workspace.mjs in the dashboard
+// repo, which keeps them in Redis:
+//   domain:{domain}   the namespace of the account that receives the domain's
+//                     mail. The domain is a zone in the Cloudflare account this
+//                     Worker runs in, with a catch-all rule that sends to it.
+//                     A domain that's been taken away keeps the value
+//                     "removed:{namespace}" (or "removed"), so mail still
+//                     routed to it is rejected rather than stored like an
+//                     unregistered domain's
+//   ttl:{namespace}   how long the account's inboxes are kept after their
+//                     latest email, in seconds. Without it, 30 minutes
+// The domain in the key is in canonical form (canonicalDomain below), the
+// form the script writes, so every way of writing the recipient's domain
+// finds the same record.
+//
+// Mail to a Workspace domain is filed under the owner's namespace, so it can
+// be read only with the owner's key, like the account's inboxes on the shared
+// domain: swift-x7k29ab@qa.example goes to inbox k7x2-swift-x7k29ab, and
+// k7x2-swift-x7k29ab@qa.example stays as it is. A local part that starts with
+// another account's namespace is filed under the owner's too (k7x2-ab12-...),
+// never under the other account's. The domain isn't part of the inbox name,
+// so x@ on each of an account's domains and k7x2-x on the shared domain all
+// share the inbox k7x2-x. Workspace mail isn't counted against the keyless
+// allowance, which protects the shared domain: a Workspace's mail is its
+// owner's. The sender blocklist applies to it all the same, because it
+// protects the platforms on it, whatever domain their mail is sent to.
+// Workspace mail is stored only once its owner's account is confirmed active:
+// under a namespace with no account, the read API would show it to anyone.
+//
+// Mail to a domain that isn't registered depends on the DOMAIN_MODE secret:
+//   unset, "strict"  rejected: only the shared domain and Workspace domains
+//                    receive mail, so a zone routed here before it's
+//                    registered or after it's removed, or a subdomain of a
+//                    Workspace's domain, can't fill inboxes anyone can read.
+//                    Any value but "open" is strict
+//   "open"           stored by its local part, as before Workspaces. A
+//                    self-hosted Worker on its own domain needs this:
+//   npx wrangler secret put DOMAIN_MODE       then type: open
+const DEFAULT_TTL = 1800;
+const MIN_TTL = 60;
+const MAX_TTL = 7 * 24 * 60 * 60;
+
+// Seconds, from the raw value of ttl:{namespace}: only a plain whole number
+// counts, held within MIN_TTL..MAX_TTL; anything else means the default. Must
+// match retentionSeconds() in the dashboard's src/lib/workspaces.js.
+function retentionSeconds(value) {
+  const text = typeof value === "number" ? String(value) : typeof value === "string" ? value.trim() : "";
+  if (!/^\d{1,9}$/.test(text) || Number(text) === 0) return DEFAULT_TTL;
+  return Math.min(MAX_TTL, Math.max(MIN_TTL, Number(text)));
+}
+
+function strictDomains(env) {
+  return String(env.DOMAIN_MODE ?? "").trim().toLowerCase() !== "open";
+}
+
+// The recipient's domain in the one form domain:{domain} keys use: lowercase
+// ASCII, an internationalized name in its xn-- form, no trailing dot. The
+// sender writes the envelope recipient, so QA.Example., qa。example,
+// full-width letters and the Unicode form of an IDN must all reach the record
+// for qa.example (or its xn-- form); URL's host parser maps them, as browsers
+// do. Null when the result isn't a plain host name.
+function canonicalDomain(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text || /[\s\/\\?#:@[\]%]/.test(text)) return null;
+  let host;
+  try {
+    host = new URL(`http://${text}/`).hostname;
+  } catch {
+    return null;
+  }
+  host = host.replace(/\.+$/, "");
+  return HOST_NAME.test(host) ? host : null;
+}
+
+// The inbox for mail to a Workspace domain, or null if the name can't take the
+// owner's prefix within the 64-character limit.
+function workspaceInbox(ns, inboxName) {
+  const name = inboxName.startsWith(`${ns}-`) ? inboxName : `${ns}-${inboxName}`;
+  return name.length <= 64 ? name : null;
+}
+
 // What a held inbox receives instead of the email, so a test that waits for
 // mail fails with the reason rather than a timeout. Names the sender's domain,
 // never anything from the held message: for consumer mailbox providers, where
@@ -246,14 +337,17 @@ function capIdentity(headerFrom, envelopeFrom) {
 // ============================================
 // Platforms whose verification codes were being farmed through free inboxes:
 // one fresh inbox per signup, spread thinly enough that the hourly cap never
-// saw a burst. Nobody testing their own app needs mail from these senders, so
-// it is rejected outright. Matched on the parent domain of the header From,
-// so sc.mail.deepseek.com counts as deepseek.com. Public on purpose: what we
+// saw a burst. OpenAI's were farmed by an automated ChatGPT registration run
+// in August 2026. Nobody testing their own app needs mail from these senders,
+// so it is rejected outright, on the shared domain and on Workspace domains
+// alike. Matched on the parent domain of the header From, so
+// sc.mail.deepseek.com counts as deepseek.com. Public on purpose: what we
 // refuse can be public; who we exempt cannot.
 const SENDER_BLOCKLIST = new Set([
   "deepseek.com",
   "eazo.ai",
   "miraimindjp.com",
+  "openai.com",
   "platoapp.com",
   "reddit.com",
   "runbios.ai",
@@ -268,11 +362,58 @@ export default {
     const subject = message.headers.get("subject") || "(no subject)";
     const messageId = message.headers.get("message-id") || crypto.randomUUID();
 
-    const inboxName = normalizeInboxName(to.split("@")[0]);
+    let inboxName = normalizeInboxName(to.split("@")[0]);
     if (!inboxName) {
       console.log(`[ZeroDrop] Rejected invalid recipient local part from ${from}`);
       message.setReject("Invalid recipient");
       return;
+    }
+    const recipientDomain = canonicalDomain(String(to).split("@").pop());
+    if (!recipientDomain) {
+      console.log(`[ZeroDrop] Rejected invalid recipient domain from ${from}`);
+      message.setReject("Invalid recipient");
+      return;
+    }
+    const toSandbox = recipientDomain === SANDBOX_DOMAIN;
+
+    // ============================================
+    // WORKSPACE DOMAIN
+    // ============================================
+    // Mail to any domain but the shared one may be a Workspace's (see
+    // WORKSPACES above). If Redis can't say, the handler throws and nothing
+    // is stored: a Workspace's mail must never land outside its owner's
+    // namespace. Cloudflare's documentation doesn't say what the sending
+    // server is told when an Email Worker throws (a temporary failure it
+    // retries, or a bounce), so such mail may not arrive later.
+    let workspace = null;
+    if (!toSandbox) {
+      let owner;
+      try {
+        [owner] = await redis(env, "/pipeline", [["GET", `domain:${recipientDomain}`]]);
+      } catch (lookupError) {
+        console.log(`[ZeroDrop] Domain lookup failed, nothing stored: ${lookupError.message}`);
+        throw lookupError;
+      }
+      if (owner == null) {
+        if (strictDomains(env)) {
+          console.log(`[ZeroDrop] Rejected mail to unregistered domain ${recipientDomain} from ${from} (DOMAIN_MODE=open would store it)`);
+          message.setReject("Unknown recipient domain");
+          return;
+        }
+      } else if (!isNamespace(owner)) {
+        console.log(`[ZeroDrop] Rejected mail to a closed Workspace domain from ${from}`);
+        message.setReject("This inbox is closed");
+        return;
+      } else {
+        const name = workspaceInbox(owner, inboxName);
+        if (!name) {
+          console.log(`[ZeroDrop] Rejected a Workspace recipient too long for its prefix ns=${owner} from ${from}`);
+          message.setReject("Invalid recipient");
+          return;
+        }
+        workspace = owner;
+        inboxName = name;
+      }
     }
 
     const { domain, identity } = capIdentity(message.headers.get("from"), from);
@@ -289,25 +430,31 @@ export default {
     // ============================================
     // ACCOUNT PREFIX AND KEYLESS ALLOWANCE CHECK
     // ============================================
-    // First, for a prefixed name, what ns:{namespace} holds: an active
-    // account's inbox isn't counted, and a closed one's mail is rejected.
-    // Then, if the mail counts against the allowance, the count script
-    // (COUNT_SCRIPT) admits the inbox or says to hold it. Fails open: if Redis
-    // can't answer, the email is stored and nothing is held or rejected.
+    // First, for a prefixed name, what ns:{namespace} and ttl:{namespace}
+    // hold: an active account's inbox isn't counted and keeps the account's
+    // retention, and a closed one's mail is rejected, as is a Workspace
+    // domain's mail for an account that doesn't exist. Then, if the mail
+    // counts against the allowance, the count script (COUNT_SCRIPT) admits the
+    // inbox or says to hold it. Fails open on the shared domain: if Redis
+    // can't answer, the email is stored with 30 minutes (which never shortens
+    // an inbox already kept longer: see STORE) and nothing is held or
+    // rejected. A Workspace's mail fails closed: the handler throws and
+    // nothing is stored, as for the domain lookup above.
     const mode = allowanceMode(env);
     const ns = namespaceOf(inboxName);
-    const toSandbox = String(to).split("@").pop().toLowerCase() === SANDBOX_DOMAIN;
     let allowKey =
       mode !== "off" && toSandbox && domain && !allowlisted(env, domain)
         ? `allow:${identity}:${new Date().toISOString().slice(0, 10)}`
         : null;
     let held = false;
     let closed = false;
+    let ttl = DEFAULT_TTL;
     try {
       if (ns) {
-        const [owner] = await redis(env, "/pipeline", [["GET", `ns:${ns}`]]);
+        const [owner, retention] = await redis(env, "/pipeline", [["GET", `ns:${ns}`], ["GET", `ttl:${ns}`]]);
         const state = namespaceState(owner);
-        closed = state === "closed";
+        closed = state === "closed" || (workspace !== null && state === "unregistered");
+        if (state === "active") ttl = retentionSeconds(retention);
         if (state !== "unregistered") allowKey = null; // an account's inbox: not counted
       }
       if (allowKey) {
@@ -323,6 +470,10 @@ export default {
         }
       }
     } catch (checkError) {
+      if (workspace) {
+        console.log(`[ZeroDrop] Account check failed for a Workspace domain ns=${workspace}, nothing stored: ${checkError.message}`);
+        throw checkError;
+      }
       console.log(`[ZeroDrop] Allowance check error — allowing email through: ${checkError.message}`);
     }
 
@@ -373,7 +524,7 @@ export default {
     const otp = extractOtp(bodyText, Boolean(plainMatch));
 
     // Log presence only — never the code itself. Worker logs are retained for
-    // 7 days; one-time codes must not outlive the 30-minute inbox TTL.
+    // 7 days; one-time codes must not outlive their inbox.
     console.log(`[ZeroDrop] Extracted — otp: ${otp ? "found" : "none"}, magicLink: ${magicLink ? "found" : "none"}`);
 
     // ============================================
@@ -390,8 +541,8 @@ export default {
       magicLink,
     };
 
-    await store(env, inboxName, emailPayload);
-    console.log(`[ZeroDrop] Email from ${from} → inbox:${inboxName}`);
+    const encrypted = await store(env, inboxName, emailPayload, ttl);
+    console.log(`[ZeroDrop] Email from ${from} → inbox:${inboxName} encrypted=${encrypted ? "yes" : "no"}`);
   },
 };
 
@@ -418,33 +569,42 @@ async function redis(env, path, commands) {
 }
 
 // ============================================
-// STORE — one atomic transaction
+// STORE — one script, so it's atomic
 // ============================================
-// /multi-exec is atomic: the email can't be stored without its TTL, which is
-// what makes the 30-minute retention promise hold. The stored value is an
-// array-wrapped JSON string, as before, so both read routes parse it
-// unchanged.
-async function store(env, inboxName, payload) {
+// Adds the email to the front of its inbox, keeps the newest MAX_EMAILS, and
+// sets the inbox to expire `ttl` seconds from now unless it's already set to
+// last longer. A script runs atomically, so an email is never stored without
+// an expiry, which is what makes the retention promise hold (30 minutes, or a
+// Workspace's own). And an email never shortens its inbox's life: mail stored
+// with the default 30 minutes because the account check failed can't cut
+// short older mail in an inbox its account keeps for days. (Lowering an
+// account's retention therefore applies to inboxes as they're created: one
+// already kept longer runs out its time.)
+//
+// Each inbox keeps its newest MAX_EMAILS emails. The read API returns the
+// whole list, and a fixed address with a retention of days would otherwise
+// grow one list without bound.
+//
+// KEYS[1] the inbox; ARGV[1] the stored value; ARGV[2] the TTL in seconds;
+// ARGV[3] the index of the last email kept. The stored value is an
+// array-wrapped string: the email's JSON, or with INBOX_ENCRYPTION_KEY set,
+// its encrypted form (encryption.js). Both read routes accept either.
+const MAX_EMAILS = 50;
+const STORE_SCRIPT = `
+redis.call('LPUSH', KEYS[1], ARGV[1])
+redis.call('LTRIM', KEYS[1], 0, ARGV[3])
+if redis.call('TTL', KEYS[1]) < tonumber(ARGV[2]) then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 1
+`;
+
+// Returns whether the email was encrypted.
+async function store(env, inboxName, payload, ttl = DEFAULT_TTL) {
   const key = `inbox:${inboxName}`;
-  const response = await fetch(`${env.UPSTASH_REDIS_REST_URL}/multi-exec`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${env.UPSTASH_REDIS_REST_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify([
-      ["LPUSH", key, JSON.stringify([JSON.stringify(payload)])],
-      ["EXPIRE", key, "1800"],
-    ]),
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Failed to store email: ${error}`);
-  }
-
-  const results = await response.json();
-  if (!Array.isArray(results) || results.some((r) => r && r.error)) {
-    throw new Error(`Redis transaction error: ${JSON.stringify(results)}`);
-  }
+  const { item, encrypted } = await storedForm(env, key, JSON.stringify(payload));
+  await redis(env, "/pipeline", [
+    ["EVAL", STORE_SCRIPT, "1", key, JSON.stringify([item]), String(ttl), String(MAX_EMAILS - 1)],
+  ]);
+  return encrypted;
 }

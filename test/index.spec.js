@@ -6,11 +6,12 @@ import * as lauxlib from "fengari/src/lauxlib.js";
 import { luaopen_base } from "fengari/src/lbaselib.js";
 import { to_luastring } from "fengari/src/fengaricore.js";
 import worker from "../src";
+import { decodeBase64, toBase64url } from "../src/encryption.js";
 
 // The email handler, run against an in-memory stand-in for Upstash's REST API
-// (/pipeline and /multi-exec, with the commands the worker sends). EVAL runs
-// the worker's actual Lua script, in fengari (Lua 5.3; Redis runs 5.1, which
-// behaves the same for everything the count script uses).
+// (/pipeline, with the commands the worker sends). EVAL runs the worker's
+// actual Lua scripts, in fengari (Lua 5.3; Redis runs 5.1, which behaves the
+// same for everything the count and store scripts use).
 
 // Runs a script the way Redis runs EVAL: KEYS and ARGV as tables of strings,
 // redis.call() into `call`, and the result converted as Redis converts it
@@ -71,13 +72,19 @@ const DOMAIN = "zerodrop-sandbox.online";
 const CODE = "482913";
 const SUBJECT = "Confirm your email";
 
+// Which of the worker's scripts an EVAL runs.
+const scriptName = (script) => (script.includes("LPUSH") ? "store" : script.includes("SCARD") ? "count" : "other");
+const isStore = (command) => command[0] === "EVAL" && scriptName(command[1]) === "store";
+
 function fakeRedis() {
   const strings = new Map();
   const lists = new Map();
   const sets = new Map();
   const ttls = new Map();
   const requests = [];
+  const scriptsRun = [];
   let pipelineFailure = null;
+  let failWhen = null;
   let evalFailure = null;
 
   function run([command, key, ...args]) {
@@ -86,7 +93,9 @@ function fakeRedis() {
         return strings.has(key) ? strings.get(key) : null;
       case "EVAL": {
         // ["EVAL", script, numkeys, ...keys, ...args]
-        if (evalFailure === "string-reply") return ["-1", "5"];
+        const name = scriptName(key);
+        scriptsRun.push(name);
+        if (evalFailure === "string-reply" && name === "count") return ["-1", "5"];
         const numKeys = Number(args[0]);
         return evalLua(key, args.slice(1, 1 + numKeys), args.slice(1 + numKeys), run);
       }
@@ -107,6 +116,15 @@ function fakeRedis() {
         list.unshift(args[0]);
         return list.length;
       }
+      case "LTRIM": {
+        // Only the form the store script uses: LTRIM key 0 <last index>.
+        const list = lists.get(key) ?? [];
+        list.splice(Number(args[1]) + 1);
+        return "OK";
+      }
+      case "TTL":
+        if (ttls.has(key)) return ttls.get(key);
+        return lists.has(key) || strings.has(key) || sets.has(key) ? -1 : -2;
       case "EXPIRE":
         ttls.set(key, Number(args[0]));
         return 1;
@@ -131,32 +149,46 @@ function fakeRedis() {
     if (init.headers.Authorization !== `Bearer ${REDIS_TOKEN}`) {
       return Response.json({ error: "WRONGPASS" }, { status: 401 });
     }
-    if (path === "/pipeline" && pipelineFailure === "network") throw new TypeError("network connection lost");
-    if (path === "/pipeline" && pipelineFailure === "error-reply") {
-      return Response.json(commands.map(() => ({ error: "ERR max requests limit exceeded" })));
+    if (path !== "/pipeline") throw new Error(`fake Redis: unexpected path ${path}`);
+    if (pipelineFailure && failWhen(commands)) {
+      if (pipelineFailure === "network") throw new TypeError("network connection lost");
+      if (pipelineFailure === "error-reply") {
+        return Response.json(commands.map(() => ({ error: "ERR max requests limit exceeded" })));
+      }
+      if (pipelineFailure === "http-500") return new Response("<html>bad gateway</html>", { status: 502 });
     }
-    if (path === "/pipeline" && pipelineFailure === "http-500") {
-      return new Response("<html>bad gateway</html>", { status: 502 });
-    }
-    if (path !== "/pipeline" && path !== "/multi-exec") throw new Error(`fake Redis: unexpected path ${path}`);
     return Response.json(commands.map(reply));
   }
 
   return {
     strings,
+    lists,
     sets,
     ttls,
     requests,
     handle,
-    failPipeline(kind) {
+    // Makes requests fail: by default every lookup and count, never the store
+    // itself (the case the worker fails open for); `when` picks requests by
+    // their commands instead.
+    failPipeline(kind, when = (commands) => !commands.some(isStore)) {
       pipelineFailure = kind;
+      failWhen = when;
     },
     failEval(kind) {
       evalFailure = kind;
     },
+    // How many times a script ran: "store" (STORE_SCRIPT, so how many emails
+    // were stored) or "count" (COUNT_SCRIPT).
+    scriptRuns(name) {
+      return scriptsRun.filter((n) => n === name).length;
+    },
     // The emails stored for an inbox, newest first, as the read API sees them.
     inbox(name) {
       return (lists.get(`inbox:${name}`) ?? []).map((v) => JSON.parse(JSON.parse(v)[0]));
+    },
+    // The stored items themselves, before any parsing or decryption.
+    items(name) {
+      return (lists.get(`inbox:${name}`) ?? []).map((v) => JSON.parse(v)[0]);
     },
     commandsSent() {
       return requests.flatMap((r) => r.commands.map((c) => c[0]));
@@ -322,14 +354,21 @@ describe("keyless allowance, enforced by default", () => {
     }
   });
 
-  it("doesn't count mail to any other receiving domain, such as a Workspace's", async () => {
+  it("doesn't count mail to any other receiving domain: a Workspace's, or a self-hosted one", async () => {
     await fillAllowance(5);
+    redis.strings.set("domain:qa.customer.example", "k7x2");
+    redis.strings.set("ns:k7x2", ACCOUNT_ID);
     for (let i = 0; i < 3; i++) {
       const name = freshName();
       const msg = message({ to: `${name}@qa.customer.example` });
       await worker.email(msg, baseEnv, { waitUntil() {} });
       expect(msg.rejected).toBeNull();
-      expect(redis.inbox(name)[0].subject).toBe(SUBJECT);
+      expect(redis.inbox(`k7x2-${name}`)[0].subject).toBe(SUBJECT);
+      const own = freshName();
+      const selfHosted = message({ to: `${own}@self-hosted.example` });
+      await worker.email(selfHosted, { ...baseEnv, DOMAIN_MODE: "open" }, { waitUntil() {} });
+      expect(selfHosted.rejected).toBeNull();
+      expect(redis.inbox(own)[0].subject).toBe(SUBJECT);
     }
     expect(redis.sets.get(allowKey("example.com")).size).toBe(5);
   });
@@ -388,7 +427,7 @@ describe("ALLOWANCE_MODE", () => {
     const names = await fillAllowance(7, { env });
     expect(redis.inbox(names[6])[0].subject).toBe(SUBJECT);
     expect(redis.sets.size).toBe(0);
-    expect(redis.commandsSent()).not.toContain("EVAL");
+    expect(redis.scriptRuns("count")).toBe(0);
   });
 
   it("enforces for any other value", async () => {
@@ -416,8 +455,8 @@ describe("account prefixes", () => {
     const msg = await deliver(name);
     expect(msg.rejected).toBe("This inbox is closed");
     expect(redis.inbox(name)).toHaveLength(0);
-    expect(redis.commandsSent()).not.toContain("LPUSH");
-    expect(redis.commandsSent()).not.toContain("EVAL");
+    expect(redis.scriptRuns("store")).toBe(0);
+    expect(redis.scriptRuns("count")).toBe(0);
     expect(logs.some((l) => l.includes("Rejected mail to a closed prefix ns=k7x2 sender=example.com"))).toBe(true);
   });
 
@@ -514,9 +553,505 @@ describe("fails open", () => {
   });
 });
 
+describe("Workspaces", () => {
+  const WS = "qa.example"; // a Workspace's own domain
+  const register = (ns = "k7x2", state = ACCOUNT_ID) => {
+    redis.strings.set(`domain:${WS}`, ns);
+    if (state) redis.strings.set(`ns:${ns}`, state);
+  };
+  async function deliverTo(address, { env = {}, ...opts } = {}) {
+    const msg = message({ to: address, ...opts });
+    await worker.email(msg, { ...baseEnv, ...env }, { waitUntil() {} });
+    return msg;
+  }
+
+  it("files a Workspace domain's mail under its owner's namespace", async () => {
+    register();
+    const name = freshName();
+    const msg = await deliverTo(`${name}@${WS}`);
+    expect(msg.rejected).toBeNull();
+    const [email] = redis.inbox(`k7x2-${name}`);
+    expect(email.subject).toBe(SUBJECT);
+    expect(email.to).toBe(`${name}@${WS}`);
+    expect(redis.inbox(name)).toHaveLength(0);
+  });
+
+  it("keeps a name that already has the owner's prefix, and matches the domain case-insensitively", async () => {
+    register();
+    const name = freshName("k7x2-swift");
+    await deliverTo(`${name}@QA.Example.`);
+    expect(redis.inbox(name)[0].subject).toBe(SUBJECT);
+  });
+
+  it("files another account's prefix under the owner's, never the other account's", async () => {
+    register();
+    redis.strings.set("ns:ab12", "9e8d7c6b-5a49-4382-9170-6f5e4d3c2b1a");
+    const name = freshName("ab12-swift");
+    await deliverTo(`${name}@${WS}`);
+    expect(redis.inbox(`k7x2-${name}`)[0].subject).toBe(SUBJECT);
+    expect(redis.inbox(name)).toHaveLength(0);
+  });
+
+  it("rejects a name that would pass 64 characters with the prefix", async () => {
+    register();
+    const name = "a".repeat(60);
+    const msg = await deliverTo(`${name}@${WS}`);
+    expect(msg.rejected).toBe("Invalid recipient");
+    expect(redis.scriptRuns("store")).toBe(0);
+  });
+
+  it("doesn't count it against the allowance", async () => {
+    register();
+    for (let i = 0; i < 7; i++) await deliverTo(`${freshName()}@${WS}`);
+    const name = freshName();
+    const msg = await deliverTo(`${name}@${WS}`);
+    expect(msg.rejected).toBeNull();
+    expect(redis.inbox(`k7x2-${name}`)[0].subject).toBe(SUBJECT);
+    expect(redis.scriptRuns("count")).toBe(0);
+  });
+
+  it.each(["noreply@reddit.com", "noreply@tm.openai.com"])(
+    "rejects a blocklisted sender (%s), as the shared domain does",
+    async (from) => {
+      register();
+      const name = freshName();
+      const msg = await deliverTo(`${name}@${WS}`, { from });
+      expect(msg.rejected).toBe("Mail from this sender is not accepted");
+      expect(redis.scriptRuns("store")).toBe(0);
+      expect(redis.inbox(`k7x2-${name}`)).toHaveLength(0);
+      expect((await deliver(freshName(), { from })).rejected).toBe("Mail from this sender is not accepted");
+    }
+  );
+
+  it.each([
+    ["suspended", "suspended"],
+    ["deleted", "retired"],
+    ["missing", null],
+  ])("rejects mail for a Workspace whose account is %s", async (_, state) => {
+    register("k7x2", state);
+    const msg = await deliverTo(`${freshName()}@${WS}`);
+    expect(msg.rejected).toBe("This inbox is closed");
+    expect(redis.scriptRuns("store")).toBe(0);
+  });
+
+  it.each(["removed:k7x2", "removed", "not-a-namespace"])("rejects mail to a domain whose record is %s", async (value) => {
+    redis.strings.set(`domain:${WS}`, value);
+    const name = freshName();
+    const msg = await deliverTo(`${name}@${WS}`);
+    expect(msg.rejected).toBe("This inbox is closed");
+    expect(redis.scriptRuns("store")).toBe(0);
+    expect(redis.inbox(name)).toHaveLength(0);
+  });
+
+  it.each(["network", "error-reply", "http-500"])(
+    "throws and stores nothing when it can't look the domain up (%s)",
+    async (kind) => {
+      register();
+      redis.failPipeline(kind);
+      const msg = message({ to: `${freshName()}@${WS}` });
+      await expect(worker.email(msg, baseEnv, { waitUntil() {} })).rejects.toThrow();
+      expect(redis.scriptRuns("store")).toBe(0);
+      expect(logs.some((l) => l.includes("Domain lookup failed, nothing stored"))).toBe(true);
+    }
+  );
+
+  it.each(["network", "error-reply", "http-500"])(
+    "throws and stores nothing when it can't check the owner's account (%s)",
+    async (kind) => {
+      register();
+      redis.failPipeline(kind, (commands) => commands.some((c) => String(c[1]).startsWith("ns:")));
+      const name = freshName();
+      const msg = message({ to: `${name}@${WS}` });
+      await expect(worker.email(msg, baseEnv, { waitUntil() {} })).rejects.toThrow();
+      expect(redis.scriptRuns("store")).toBe(0);
+      expect(redis.inbox(`k7x2-${name}`)).toHaveLength(0);
+      expect(redis.inbox(name)).toHaveLength(0);
+      expect(logs.some((l) => l.includes("Account check failed for a Workspace domain ns=k7x2, nothing stored"))).toBe(true);
+    }
+  );
+
+  it("files the same name on each of an account's domains, and its prefix on the shared one, in one inbox", async () => {
+    register();
+    redis.strings.set("domain:b.example", "k7x2");
+    const name = freshName();
+    await deliverTo(`${name}@${WS}`);
+    await deliverTo(`${name}@b.example`);
+    await deliver(`k7x2-${name}`);
+    expect(redis.inbox(`k7x2-${name}`).map((e) => e.to)).toEqual([
+      `k7x2-${name}@${DOMAIN}`,
+      `${name}@b.example`,
+      `${name}@${WS}`,
+    ]);
+  });
+
+  it("stores mail to an unregistered domain as before with DOMAIN_MODE=open (self-hosting)", async () => {
+    const name = freshName();
+    await deliverTo(`${name}@self-hosted.example`, { env: { DOMAIN_MODE: "open" } });
+    expect(redis.inbox(name)[0].subject).toBe(SUBJECT);
+    expect(redis.ttls.get(`inbox:${name}`)).toBe(1800);
+  });
+
+  it("encrypts a Workspace's mail bound to the inbox it's filed under", async () => {
+    register();
+    const name = freshName();
+    await deliverTo(`${name}@${WS}`, { env: { INBOX_ENCRYPTION_KEY: KEY } });
+    const [item] = redis.items(`k7x2-${name}`);
+    expect((await openItem(item, `inbox:k7x2-${name}`)).otp).toBe(CODE);
+  });
+});
+
+describe("retention", () => {
+  const ttlOf = (name) => redis.ttls.get(`inbox:${name}`);
+
+  it("keeps an account's inboxes for its retention, on its domain and on the shared one", async () => {
+    redis.strings.set("domain:qa.example", "k7x2");
+    redis.strings.set("ns:k7x2", ACCOUNT_ID);
+    redis.strings.set("ttl:k7x2", "86400");
+    const own = freshName();
+    await worker.email(message({ to: `${own}@qa.example` }), baseEnv, { waitUntil() {} });
+    const shared = freshName("k7x2-swift");
+    await deliver(shared);
+    expect(ttlOf(`k7x2-${own}`)).toBe(86400);
+    expect(ttlOf(shared)).toBe(86400);
+  });
+
+  it.each([
+    ["more than 7 days", "9999999", 604800],
+    ["under a minute", "5", 60],
+    ["with spaces around it", " 600 ", 600],
+    ["not a whole number", "1.5", 1800],
+    ["in exponent form", "1e3", 1800],
+    ["zero", "0", 1800],
+    ["negative", "-600", 1800],
+    ["not a number", "abc", 1800],
+    ["unset", null, 1800],
+  ])("keeps a retention of %s within bounds", async (_, value, expected) => {
+    redis.strings.set("ns:k7x2", ACCOUNT_ID);
+    if (value !== null) redis.strings.set("ttl:k7x2", value);
+    const name = freshName("k7x2-swift");
+    await deliver(name);
+    expect(ttlOf(name)).toBe(expected);
+  });
+
+  it("keeps 30 minutes for keyless inboxes and for an unregistered prefix", async () => {
+    redis.strings.set("ttl:k7x2", "86400"); // no ns:k7x2: not an account
+    const keyless = freshName();
+    const unregistered = freshName("k7x2-swift");
+    await deliver(keyless);
+    await deliver(unregistered);
+    expect(ttlOf(keyless)).toBe(1800);
+    expect(ttlOf(unregistered)).toBe(1800);
+  });
+
+  it("stores with 30 minutes when the account check fails, never cutting short an inbox kept longer", async () => {
+    redis.strings.set("ns:k7x2", ACCOUNT_ID);
+    redis.strings.set("ttl:k7x2", "86400");
+    const kept = freshName("k7x2-swift");
+    await deliver(kept);
+    expect(ttlOf(kept)).toBe(86400);
+
+    redis.failPipeline("network");
+    await deliver(kept);
+    const fresh = freshName("k7x2-swift");
+    await deliver(fresh);
+    expect(redis.inbox(kept)).toHaveLength(2);
+    expect(ttlOf(kept)).toBe(86400);
+    expect(ttlOf(fresh)).toBe(1800);
+  });
+
+  it("applies a lowered retention to new inboxes; one already kept longer runs out its time", async () => {
+    redis.strings.set("ns:k7x2", ACCOUNT_ID);
+    redis.strings.set("ttl:k7x2", "604800");
+    const kept = freshName("k7x2-swift");
+    await deliver(kept);
+    redis.strings.delete("ttl:k7x2");
+    await deliver(kept);
+    const fresh = freshName("k7x2-swift");
+    await deliver(fresh);
+    expect(ttlOf(kept)).toBe(604800);
+    expect(ttlOf(fresh)).toBe(1800);
+  });
+
+  it("restarts a 30-minute inbox's timer with every email", async () => {
+    const name = freshName();
+    await deliver(name);
+    redis.ttls.set(`inbox:${name}`, 12); // 12 seconds left
+    await deliver(name);
+    expect(ttlOf(name)).toBe(1800);
+  });
+});
+
+describe("storage", () => {
+  it("keeps each inbox's newest 50 emails", async () => {
+    const name = freshName();
+    for (let i = 0; i < 53; i++) await deliver(name);
+    expect(redis.lists.get(`inbox:${name}`)).toHaveLength(50);
+  });
+
+  it("stores each email and its expiry in one script", async () => {
+    const name = freshName();
+    await deliver(name);
+    const stores = redis.requests.filter((r) => r.commands.some(isStore));
+    expect(stores).toHaveLength(1);
+    expect(stores[0].commands).toHaveLength(1);
+    const [, , numKeys, key, , ttl, lastIndex] = stores[0].commands[0];
+    expect([numKeys, key, ttl, lastIndex]).toEqual(["1", `inbox:${name}`, "1800", "49"]);
+    expect(redis.ttls.get(`inbox:${name}`)).toBe(1800);
+  });
+});
+
+describe("recipient domain", () => {
+  const register = (domain, ns = "k7x2") => {
+    redis.strings.set(`domain:${domain}`, ns);
+    redis.strings.set(`ns:${ns}`, ACCOUNT_ID);
+  };
+  async function deliverTo(address, env = {}) {
+    const msg = message({ to: address });
+    await worker.email(msg, { ...baseEnv, ...env }, { waitUntil() {} });
+    return msg;
+  }
+
+  it.each([
+    ["upper case and trailing dots", (n) => `${n}@QA.EXAMPLE..`],
+    ["an ideographic full stop", (n) => `${n}@qa。example`],
+    ["full-width letters", (n) => `${n}@ｑａ.example`],
+  ])("finds a Workspace domain written with %s", async (_, address) => {
+    register("qa.example");
+    const name = freshName();
+    const msg = await deliverTo(address(name));
+    expect(msg.rejected).toBeNull();
+    expect(redis.inbox(`k7x2-${name}`)).toHaveLength(1);
+    expect(redis.inbox(name)).toHaveLength(0);
+  });
+
+  it("finds an internationalized Workspace domain by its xn-- form", async () => {
+    register("xn--bcher-kva.example");
+    const name = freshName();
+    await deliverTo(`${name}@bücher.example`);
+    await deliverTo(`${name}@BÜCHER.example`);
+    expect(redis.inbox(`k7x2-${name}`)).toHaveLength(2);
+    expect(redis.inbox(name)).toHaveLength(0);
+  });
+
+  it.each([
+    ["an underscore", "qa_example.com"],
+    ["a leading hyphen", "-qa.example"],
+    ["a path", "qa.example/inbox"],
+    ["a port", "qa.example:25"],
+    ["an address literal", "[127.0.0.1]"],
+    ["a single label", "localhost"],
+    ["an empty label", "qa..example"],
+    ["nothing", ""],
+  ])("rejects a recipient domain with %s before Redis", async (_, domain) => {
+    const msg = await deliverTo(`${freshName()}@${domain}`);
+    expect(msg.rejected).toBe("Invalid recipient");
+    expect(redis.requests).toHaveLength(0);
+  });
+
+  describe("DOMAIN_MODE", () => {
+    it.each([undefined, "", "strict", " STRICT\n", "anything else"])(
+      "rejects mail to an unregistered domain when it is %j",
+      async (mode) => {
+        const name = freshName();
+        const msg = await deliverTo(`${name}@other.example`, mode === undefined ? {} : { DOMAIN_MODE: mode });
+        expect(msg.rejected).toBe("Unknown recipient domain");
+        expect(redis.scriptRuns("store")).toBe(0);
+        expect(logs.some((l) => l.includes("Rejected mail to unregistered domain other.example"))).toBe(true);
+      }
+    );
+
+    it("rejects a subdomain of a Workspace's domain by default", async () => {
+      register("qa.example");
+      const msg = await deliverTo(`${freshName()}@mail.qa.example`);
+      expect(msg.rejected).toBe("Unknown recipient domain");
+      expect(redis.scriptRuns("store")).toBe(0);
+    });
+
+    it("rejects mail to a domain whose record has been forgotten", async () => {
+      register("qa.example");
+      redis.strings.delete("domain:qa.example");
+      const msg = await deliverTo(`${freshName()}@qa.example`);
+      expect(msg.rejected).toBe("Unknown recipient domain");
+      expect(redis.scriptRuns("store")).toBe(0);
+    });
+
+    it("still receives mail for the shared domain and Workspace domains by default", async () => {
+      register("qa.example");
+      const shared = freshName();
+      const own = freshName();
+      expect((await deliverTo(`${shared}@${DOMAIN}`)).rejected).toBeNull();
+      expect((await deliverTo(`${own}@qa.example`)).rejected).toBeNull();
+      expect(redis.inbox(shared)).toHaveLength(1);
+      expect(redis.inbox(`k7x2-${own}`)).toHaveLength(1);
+    });
+
+    it.each(["open", " Open "])("stores mail to an unregistered domain as before when it is %j", async (mode) => {
+      const name = freshName();
+      const msg = await deliverTo(`${name}@other.example`, { DOMAIN_MODE: mode });
+      expect(msg.rejected).toBeNull();
+      expect(redis.inbox(name)).toHaveLength(1);
+    });
+  });
+});
+
+// Opens a stored item the way the read API does, written independently of
+// src/encryption.js so the two can't share a mistake: the format is
+// "zd1:<key id>:<iv>:<ciphertext>", base64url, with "zd1:<key id>:" and the
+// Redis key as the additional authenticated data.
+const KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="; // bytes 0..31
+const fromB64 = (s) =>
+  Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), (c) => c.charCodeAt(0));
+
+async function openItem(item, redisKey, keyB64 = KEY) {
+  const [version, keyId, iv, ciphertext] = item.split(":");
+  if (version !== "zd1") throw new Error(`not a sealed item: ${item.slice(0, 20)}`);
+  const key = await crypto.subtle.importKey("raw", fromB64(keyB64), "AES-GCM", false, ["decrypt"]);
+  const plain = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: fromB64(iv), additionalData: new TextEncoder().encode(`${version}:${keyId}:${redisKey}`) },
+    key,
+    fromB64(ciphertext)
+  );
+  return JSON.parse(new TextDecoder().decode(plain));
+}
+
+describe("encryption at rest", () => {
+  const env = { INBOX_ENCRYPTION_KEY: KEY };
+
+  it("stores each email encrypted, with nothing readable left in it", async () => {
+    const name = freshName();
+    await deliver(name, { env });
+    const [item] = redis.items(name);
+    expect(item).toMatch(/^zd1:[0-9a-f]{8}:[A-Za-z0-9_-]{16}:[A-Za-z0-9_-]+$/);
+    for (const plain of [CODE, SUBJECT, "noreply@app.example.com", name]) expect(item).not.toContain(plain);
+
+    const email = await openItem(item, `inbox:${name}`);
+    expect(email.subject).toBe(SUBJECT);
+    expect(email.otp).toBe(CODE);
+    expect(email.to).toBe(`${name}@${DOMAIN}`);
+  });
+
+  it("still stores the email and its 30-minute expiry in one script", async () => {
+    const name = freshName();
+    await deliver(name, { env });
+    expect(redis.scriptRuns("store")).toBe(1);
+    expect(redis.ttls.get(`inbox:${name}`)).toBe(1800);
+  });
+
+  it("binds each email to its inbox: it won't decrypt as another inbox's", async () => {
+    const name = freshName();
+    await deliver(name, { env });
+    const [item] = redis.items(name);
+    await expect(openItem(item, `inbox:${freshName()}`)).rejects.toThrow();
+  });
+
+  it("binds each email to its header: relabelled with another key id, it won't decrypt", async () => {
+    const name = freshName();
+    await deliver(name, { env });
+    const [item] = redis.items(name);
+    const parts = item.split(":");
+    const relabelled = [parts[0], parts[1] === "00000000" ? "ffffffff" : "00000000", parts[2], parts[3]].join(":");
+    await expect(openItem(relabelled, `inbox:${name}`)).rejects.toThrow();
+    expect((await openItem(item, `inbox:${name}`)).otp).toBe(CODE);
+  });
+
+  it("uses a new IV for every email", async () => {
+    const name = freshName();
+    await deliver(name, { env });
+    await deliver(name, { env });
+    const [second, first] = redis.items(name);
+    expect(second.split(":")[2]).not.toBe(first.split(":")[2]);
+    expect(second.split(":")[3]).not.toBe(first.split(":")[3]);
+  });
+
+  it("encrypts held notices too", async () => {
+    await fillAllowance(5, { env });
+    const sixth = freshName();
+    await deliver(sixth, { env });
+    const notice = await openItem(redis.items(sixth)[0], `inbox:${sixth}`);
+    expect(notice.held).toBe(true);
+    expect(notice.reason).toMatch(/^ZeroDrop held an email from example\.com/);
+  });
+
+  it("names the key by the first 8 hex characters of its SHA-256", async () => {
+    const name = freshName();
+    await deliver(name, { env });
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", fromB64(KEY)));
+    const keyId = [...digest.slice(0, 4)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    expect(redis.items(name)[0].split(":")[1]).toBe(keyId);
+  });
+
+  it("accepts the key in base64url form, with surrounding whitespace", async () => {
+    const urlForm = ` ${KEY.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")}\n`;
+    const name = freshName();
+    await deliver(name, { env: { INBOX_ENCRYPTION_KEY: urlForm } });
+    expect((await openItem(redis.items(name)[0], `inbox:${name}`)).otp).toBe(CODE);
+  });
+
+  it.each([
+    ["too short", "c2hvcnQ="],
+    ["too long", btoa("x".repeat(33))],
+    ["not base64", "not a key!"],
+    ["empty", ""],
+    ["only whitespace", "  \n"],
+  ])("stores nothing with a key that is %s, rather than storing it unencrypted", async (_, badKey) => {
+    const name = freshName();
+    const msg = message({ to: `${name}@${DOMAIN}` });
+    await expect(worker.email(msg, { ...baseEnv, INBOX_ENCRYPTION_KEY: badKey }, { waitUntil() {} })).rejects.toThrow(
+      "INBOX_ENCRYPTION_KEY must be 32 bytes, base64-encoded"
+    );
+    expect(redis.scriptRuns("store")).toBe(0);
+  });
+
+  it("logs whether each email was encrypted, and never the key", async () => {
+    await deliver(freshName(), { env });
+    await deliver(freshName());
+    expect(logs.filter((l) => l.endsWith("encrypted=yes"))).toHaveLength(1);
+    expect(logs.filter((l) => l.endsWith("encrypted=no"))).toHaveLength(1);
+    for (const line of logs) expect(line).not.toContain(KEY);
+  });
+
+  it("encodes and decodes base64url to a known vector", () => {
+    const bytes = Uint8Array.from({ length: 32 }, (_, i) => i);
+    expect(toBase64url(bytes)).toBe("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8");
+    expect([...decodeBase64(KEY)]).toEqual([...bytes]);
+    expect([...decodeBase64("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8")]).toEqual([...bytes]);
+    expect(decodeBase64("not base64!")).toBeNull();
+    expect(decodeBase64("abcde")).toBeNull();
+  });
+
+  it("stores plain JSON without the key, as before", async () => {
+    const name = freshName();
+    await deliver(name);
+    expect(JSON.parse(redis.items(name)[0]).otp).toBe(CODE);
+  });
+
+  it.each(["true", "TRUE ", "1", "yes", "on", "enabled"])(
+    "with INBOX_ENCRYPTION_REQUIRED=%j and no key, stores nothing rather than plain JSON",
+    async (value) => {
+      const msg = message({ to: `${freshName()}@${DOMAIN}` });
+      await expect(
+        worker.email(msg, { ...baseEnv, INBOX_ENCRYPTION_REQUIRED: value }, { waitUntil() {} })
+      ).rejects.toThrow("INBOX_ENCRYPTION_REQUIRED is set but INBOX_ENCRYPTION_KEY isn't");
+      expect(redis.scriptRuns("store")).toBe(0);
+    }
+  );
+
+  it("with INBOX_ENCRYPTION_REQUIRED and the key, encrypts as usual", async () => {
+    const name = freshName();
+    await deliver(name, { env: { ...env, INBOX_ENCRYPTION_REQUIRED: "true" } });
+    expect((await openItem(redis.items(name)[0], `inbox:${name}`)).otp).toBe(CODE);
+  });
+
+  it.each(["", "0", "false", "No", " off "])("treats INBOX_ENCRYPTION_REQUIRED=%j as off", async (value) => {
+    const name = freshName();
+    await deliver(name, { env: { INBOX_ENCRYPTION_REQUIRED: value } });
+    expect(JSON.parse(redis.items(name)[0]).otp).toBe(CODE);
+  });
+});
+
 describe("rejected before Redis", () => {
-  it("rejects blocked senders", async () => {
-    const msg = await deliver(freshName(), { from: "noreply@sc.mail.deepseek.com" });
+  it.each(["noreply@sc.mail.deepseek.com", "noreply@tm.openai.com"])("rejects blocked senders (%s)", async (from) => {
+    const msg = await deliver(freshName(), { from });
     expect(msg.rejected).toBe("Mail from this sender is not accepted");
     expect(redis.requests).toHaveLength(0);
   });

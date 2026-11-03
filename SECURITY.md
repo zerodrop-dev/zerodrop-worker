@@ -17,10 +17,33 @@ ZeroDrop is a disposable email inbox service built for CI/CD pipelines. This doc
 - **Abuse counters** — for each sending domain (or full address, for consumer
   mailbox providers), the set of inbox names it reached in the current UTC day.
   Used only for the keyless allowance; expires after 2 days.
+- **Workspace settings** — a Workspace's own receiving domain and retention,
+  each recorded against its account prefix
 - **Held-mail notices** — when the keyless allowance holds an email, the inbox
   gets a short notice from `notice@zerodrop.dev` in its place, naming only the
   sender's domain. The held email itself is not stored. A notice is deleted with
   its inbox, like any other message.
+
+### Encryption
+On zerodrop.dev each stored email (its payload, extracted code and link, and
+held-mail notices) is encrypted with AES-256-GCM inside the worker, before it
+reaches Redis. Every email gets a fresh IV, and its header and Redis key are
+the additional authenticated data, so it decrypts only as the inbox it was
+stored in. The key is a Cloudflare Worker secret (`INBOX_ENCRYPTION_KEY`)
+shared with the read API, never with the database provider. The format is in
+[`src/encryption.js`](src/encryption.js).
+
+What stays readable in the database: inbox names (they are the Redis keys),
+the counters behind rate limits and the daily allowance (IP addresses and
+sending domains or addresses, kept up to 2 days), account and Workspace
+records, and any email stored before encryption was switched on. An inbox that
+keeps receiving mail keeps such older emails, up to its newest 50, until it
+goes quiet for its retention. Someone who could write to
+the database could delete emails, or copy an encrypted email within its own
+inbox, but couldn't read one, change one or move one to another inbox without
+the key. With `INBOX_ENCRYPTION_REQUIRED` set, the worker stores nothing rather
+than store an email unencrypted, and the read API skips any email that isn't
+encrypted.
 
 ### What we don't store
 - Authentication tokens or cookies
@@ -45,18 +68,34 @@ Our dashboard host and Cloudflare also keep standard request logs (IP address,
 user agent, request path) for up to 7 days.
 
 ### Retention
-All inbox data is stored in Upstash Redis with a **30-minute TTL**. The email and
-its expiry are written in a single atomic transaction, so a message cannot be
-stored without its deletion timer. Each new message restarts its inbox's timer,
-so an inbox and everything in it are deleted 30 minutes after its latest
-message; while mail keeps arriving, earlier messages stay with it.
+Inbox data is stored in Upstash Redis with a **30-minute TTL**, unless a
+Workspace sets its own (below). The email and its expiry are written by one
+atomic script, so a message cannot be stored without its deletion timer. Each
+new message restarts its inbox's timer, so an inbox and everything in it are
+deleted 30 minutes after its latest message; while mail keeps arriving, earlier
+messages stay with it, up to the newest 50 per inbox.
+
+A Workspace can have its own retention instead, set per account, from 1 minute
+up to 7 days. It applies to the account's inboxes (its prefix on the shared
+domain and its own domain), with the same atomic expiry. A new message never
+shortens an inbox's timer, so lowering a Workspace's retention applies to
+inboxes as they're created; one already kept longer runs out its time.
 
 ### Edge processing
 Processing happens entirely inside the Cloudflare Worker at the edge — before any
 data reaches Redis. The worker:
-1. Validates the recipient address; malformed addresses are rejected
+1. Validates the recipient address; malformed addresses are rejected, and the
+   domain is put in one canonical form (lower case, an internationalized name
+   in its `xn--` form) before it's looked up. Mail to a Workspace's own domain
+   is filed under the owner's account prefix, so only the owner's key can read
+   it, and only once the owner's account is confirmed active: if the domain or
+   the account can't be looked up, the worker throws and stores nothing, rather
+   than store the mail anywhere else. (Cloudflare doesn't document whether the
+   sending server then retries.) Mail to any domain that is neither the shared
+   domain nor a Workspace's is rejected (a self-hosted worker on its own domain
+   sets `DOMAIN_MODE=open` instead)
 2. Rejects mail from a short list of platforms whose verification codes were
-   being farmed through free inboxes
+   being farmed through free inboxes, on every domain, a Workspace's included
 3. Checks the inbox's account prefix, if it has one (`k7x2-…`): mail to a
    suspended or deleted account's prefix is rejected, because the read API
    returns it to nobody; an active account's inboxes aren't counted in step 4
@@ -66,12 +105,14 @@ data reaches Redis. The worker:
    parsed or stored, and the inbox receives a short notice naming the sender's
    domain and how to get a free key
 5. Extracts OTP codes and magic links from the plain-text body
-6. Stores the message under `inbox:{name}` with a 1800s TTL, atomically
+6. Encrypts the message (see Encryption) and stores it under `inbox:{name}`
+   with its TTL (see Retention), atomically
 
 The allowance (4) ran in monitoring mode — logging what it would hold — from
-October 13, 2026 while API keys rolled out, and is now enforced. If Redis can't
-answer the checks in steps 3 and 4, the mail is stored rather than held or
-rejected.
+October 13, 2026 while API keys rolled out, and is now enforced. On the shared
+domain, if Redis can't answer the checks in steps 3 and 4, the mail is stored
+with the default 30 minutes rather than held or rejected; a Workspace's mail is
+never stored without them.
 
 The worker source code is fully auditable:
 → https://github.com/zerodrop-dev/zerodrop-worker
@@ -81,8 +122,8 @@ OTPs and magic links are extracted at the edge using pattern matching on the
 plain-text email body. Codes adjacent to a label ("code", "OTP", "verification
 code", and similar) are preferred; a bare number is used only as a fallback, and
 values that look like years, prices or percentages are skipped. They are stored
-alongside the raw email payload in Redis and are deleted with the rest of the
-inbox data. Extraction happens entirely within Cloudflare's
+with the email, encrypted with it, and are deleted with the rest of the inbox
+data. Extraction happens entirely within Cloudflare's
 infrastructure — no external service is called, and the worker never writes
 codes to its logs (see Logs).
 
@@ -147,8 +188,9 @@ message, but the free tier is not the right place for anything sensitive.
 
 **Mitigation:** Production CI pipelines should use ZeroDrop Workspaces, which
 receive mail on a domain used only by your team rather than the shared sandbox
-domain, so shared-domain blocklists don't apply. Workspaces are set up
-individually with each customer today — email founder@zerodrop.dev.
+domain, so shared-domain blocklists don't apply, and every inbox on it can be
+read only with your team's key. Workspaces are set up individually with each
+customer — email founder@zerodrop.dev.
 
 ---
 
@@ -191,10 +233,11 @@ We will acknowledge receipt within 48 hours and aim to resolve critical issues w
 | Threat | Mitigation |
 |--------|-----------|
 | Inbox enumeration | Names are random and generated client-side; the 30-minute TTL limits the window. But the name is the only access control on the free tier — treat free-tier inboxes as public |
-| Data persistence | Hard Redis TTL, written atomically with each message — an inbox is deleted 30 minutes after its latest message, regardless of application logic |
+| Data persistence | Hard Redis TTL, written atomically with each message — an inbox is deleted 30 minutes after its latest message (or after a Workspace's own retention, at most 7 days), regardless of application logic |
+| Database exposure | Emails are encrypted with AES-256-GCM before they reach Redis, with a key the database provider never holds; each one decrypts only as the inbox it was stored in. Inbox names, counters and account records aren't encrypted, and a keyless inbox can be read through the API by anyone who learns its name, so a leaked list of keys still exposes keyless inboxes while they last. Inboxes under an API key's prefix or on a Workspace's domain also need the key |
 | Malformed recipient addresses | Validated at the worker and in the read API; only `[a-z0-9._+-]` names up to 64 characters are accepted |
 | Supply chain attack via Action | SHA pinning documented; worker source is auditable |
-| OTP theft | 30-min TTL limits exposure window; the worker never logs codes or subject lines; on the free tier they're accessible to whoever knows the inbox name |
+| OTP theft | The TTL limits the exposure window (30 minutes, or a Workspace's own retention); the worker never logs codes or subject lines; on the free tier they're accessible to whoever knows the inbox name |
 | Spam and registration farming | Mail from platforms whose codes were being farmed is rejected outright. Without an API key, one sender can reach 5 different inboxes a day; mail past that is held and the inbox gets a notice instead; see Edge processing |
 | Shared domain blocklist | Free tier risk documented; Workspaces use a domain dedicated to your team |
 
