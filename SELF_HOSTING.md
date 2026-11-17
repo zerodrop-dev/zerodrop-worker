@@ -60,6 +60,10 @@ npx wrangler secret put ALLOWLIST_UNTIL
 npx wrangler secret put ALLOWANCE_MODE
 # optional: "off" to stop counting, "shadow" to log only
 
+npx wrangler secret put SENDER_TALLY
+# optional: "on" keeps a per-day count of mail by sending domain in Redis
+# (senders:{date}, kept 8 days; never an address)
+
 npx wrangler secret put INBOX_ENCRYPTION_KEY
 # optional: 32 random bytes, base64, e.g. from
 #   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"

@@ -42,6 +42,7 @@ Secrets are stored as Cloudflare Worker secrets — never in code or git history
 | `CAP_ALLOWLIST` | Optional. Comma-separated parent domains whose mail is exempt from the keyless allowance (`example.com` covers `noreply@mail.example.com`; `mail.example.com` matches nothing) |
 | `ALLOWLIST_UNTIL` | Optional. A date (`YYYY-MM-DD`, UTC) after which `CAP_ALLOWLIST` stops applying |
 | `ALLOWANCE_MODE` | Optional. `shadow` logs what the keyless allowance would hold but stores the mail anyway; `off` stops counting. Unset, the allowance is enforced |
+| `SENDER_TALLY` | Optional. `on` keeps a per-day count of stored and held mail by sending domain (`senders:{date}` in Redis, kept 8 days), so you can see which organisations use your instance without reading logs. Never an address: consumer mailbox providers aren't counted. Unset, nothing is counted |
 | `INBOX_ENCRYPTION_KEY` | Optional. 32 random bytes, base64. With it set, every email (and every held-mail notice) is encrypted with AES-256-GCM before it leaves the worker, bound to its inbox; whatever reads the inboxes needs the same key (the format is in [`src/encryption.js`](src/encryption.js)). Unset, emails are stored as plain JSON. A value that isn't 32 bytes, an empty one included, makes the worker store nothing rather than store mail unencrypted |
 | `INBOX_ENCRYPTION_REQUIRED` | Optional. `true` makes the worker store nothing rather than store an email unencrypted, should `INBOX_ENCRYPTION_KEY` ever be missing. Any value but `0`, `false`, `no` or `off` turns it on |
 | `DOMAIN_MODE` | Unset (or `strict`), mail to any domain but `zerodrop-sandbox.online` and the Workspace domains registered in Redis is rejected. `open` stores mail to an unregistered domain by its local part, as before Workspaces: a self-hosted worker on its own domain needs it |
@@ -65,6 +66,7 @@ npx wrangler secret put UPSTASH_REDIS_REST_TOKEN
 npx wrangler secret put CAP_ALLOWLIST     # optional
 npx wrangler secret put ALLOWLIST_UNTIL   # optional
 npx wrangler secret put ALLOWANCE_MODE    # optional
+npx wrangler secret put SENDER_TALLY      # optional: "on"
 npx wrangler secret put INBOX_ENCRYPTION_KEY  # optional, see above
 npx wrangler secret put INBOX_ENCRYPTION_REQUIRED  # optional
 npx wrangler secret put DOMAIN_MODE       # "open" for a worker on your own domain

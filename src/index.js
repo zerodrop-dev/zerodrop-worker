@@ -355,6 +355,34 @@ const SENDER_BLOCKLIST = new Set([
   "x.ai",
 ]);
 
+// ============================================
+// SENDER TALLY (off unless SENDER_TALLY is "on")
+// ============================================
+// A per-day count of mail by sending domain, so whoever runs the service can
+// see which organisations test with it without reading logs. senders:{UTC
+// date} is a hash of "{kind}:{domain}" to a count of emails, kept 8 days:
+//   free  stored on the shared domain, without an account prefix
+//   key   stored under an account's prefix
+//   ws    stored on a Workspace's own domain
+//   held  held by the keyless allowance (only the notice was stored)
+// Never an address: consumer mailbox providers (CONSUMER_MAILBOX) aren't
+// counted at all. It runs after the email is stored or held, through
+// ctx.waitUntil, so a failed count never affects delivery.
+//   npx wrangler secret put SENDER_TALLY       then type: on
+const TALLY_TTL = 8 * 24 * 60 * 60;
+const TALLY_DOMAIN = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/;
+
+function tallySender(env, ctx, kind, domain) {
+  if (String(env.SENDER_TALLY || "").trim().toLowerCase() !== "on") return;
+  if (!domain || domain.length > 253 || !TALLY_DOMAIN.test(domain) || CONSUMER_MAILBOX.has(domain)) return;
+  const key = `senders:${new Date().toISOString().slice(0, 10)}`;
+  const work = redis(env, "/pipeline", [
+    ["HINCRBY", key, `${kind}:${domain}`, "1"],
+    ["EXPIRE", key, String(TALLY_TTL)],
+  ]).catch((tallyError) => console.log(`[ZeroDrop] Sender tally failed: ${tallyError.message}`));
+  ctx?.waitUntil?.(work);
+}
+
 export default {
   async email(message, env, ctx) {
     const from = message.from;
@@ -448,6 +476,7 @@ export default {
         : null;
     let held = false;
     let closed = false;
+    let account = false;
     let ttl = DEFAULT_TTL;
     try {
       if (ns) {
@@ -455,6 +484,7 @@ export default {
         const state = namespaceState(owner);
         closed = state === "closed" || (workspace !== null && state === "unregistered");
         if (state === "active") ttl = retentionSeconds(retention);
+        account = state === "active";
         if (state !== "unregistered") allowKey = null; // an account's inbox: not counted
       }
       if (allowKey) {
@@ -486,6 +516,7 @@ export default {
     if (held) {
       // The email itself is never parsed or stored; the inbox gets the notice.
       await store(env, inboxName, noticePayload(to, domain, identity !== domain));
+      tallySender(env, ctx, "held", domain);
       return;
     }
 
@@ -543,6 +574,7 @@ export default {
 
     const encrypted = await store(env, inboxName, emailPayload, ttl);
     console.log(`[ZeroDrop] Email from ${from} → inbox:${inboxName} encrypted=${encrypted ? "yes" : "no"}`);
+    tallySender(env, ctx, workspace ? "ws" : account ? "key" : "free", domain);
   },
 };
 

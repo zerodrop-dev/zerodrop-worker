@@ -17,6 +17,9 @@ ZeroDrop is a disposable email inbox service built for CI/CD pipelines. This doc
 - **Abuse counters** — for each sending domain (or full address, for consumer
   mailbox providers), the set of inbox names it reached in the current UTC day.
   Used only for the keyless allowance; expires after 2 days.
+- **Sender tally** (only with `SENDER_TALLY=on`, as on zerodrop.dev) — for each
+  sending domain, how many of its emails were stored or held each UTC day. Never
+  an address: consumer mailbox providers aren't counted. Expires after 8 days.
 - **Workspace settings** — a Workspace's own receiving domain and retention,
   each recorded against its account prefix
 - **Held-mail notices** — when the keyless allowance holds an email, the inbox
@@ -35,8 +38,9 @@ shared with the read API, never with the database provider. The format is in
 
 What stays readable in the database: inbox names (they are the Redis keys),
 the counters behind rate limits and the daily allowance (IP addresses and
-sending domains or addresses, kept up to 2 days), account and Workspace
-records, and any email stored before encryption was switched on. An inbox that
+sending domains or addresses, kept up to 2 days), the sender tally (sending
+domains and counts, kept 8 days), account and Workspace records, and any email
+stored before encryption was switched on. An inbox that
 keeps receiving mail keeps such older emails, up to its newest 50, until it
 goes quiet for its retention. Someone who could write to
 the database could delete emails, or copy an encrypted email within its own
@@ -47,7 +51,7 @@ encrypted.
 
 ### What we don't store
 - Authentication tokens or cookies
-- Any data outside the email payload, the abuse counters above, and the logs below
+- Any data outside the email payload, the abuse counters and sender tally above, and the logs below
 
 Note: the raw MIME payload we store until the inbox expires includes the message's own
 `Received:` headers, which typically contain the sending relay's IP address. We

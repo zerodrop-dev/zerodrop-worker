@@ -80,6 +80,7 @@ function fakeRedis() {
   const strings = new Map();
   const lists = new Map();
   const sets = new Map();
+  const hashes = new Map();
   const ttls = new Map();
   const requests = [];
   const scriptsRun = [];
@@ -110,6 +111,13 @@ function fakeRedis() {
         set.add(args[0]);
         return added;
       }
+      case "HINCRBY": {
+        const hash = hashes.get(key) ?? new Map();
+        hashes.set(key, hash);
+        const value = (hash.get(args[0]) ?? 0) + Number(args[1]);
+        hash.set(args[0], value);
+        return value;
+      }
       case "LPUSH": {
         const list = lists.get(key) ?? [];
         lists.set(key, list);
@@ -124,7 +132,7 @@ function fakeRedis() {
       }
       case "TTL":
         if (ttls.has(key)) return ttls.get(key);
-        return lists.has(key) || strings.has(key) || sets.has(key) ? -1 : -2;
+        return lists.has(key) || strings.has(key) || sets.has(key) || hashes.has(key) ? -1 : -2;
       case "EXPIRE":
         ttls.set(key, Number(args[0]));
         return 1;
@@ -164,6 +172,7 @@ function fakeRedis() {
     strings,
     lists,
     sets,
+    hashes,
     ttls,
     requests,
     handle,
@@ -1060,5 +1069,68 @@ describe("rejected before Redis", () => {
     const msg = await deliver("Not Valid!");
     expect(msg.rejected).toBe("Invalid recipient");
     expect(redis.requests).toHaveLength(0);
+  });
+});
+
+describe("sender tally", () => {
+  const tallyKey = () => `senders:${today()}`;
+  const tally = () => Object.fromEntries(redis.hashes.get(tallyKey()) ?? []);
+
+  // Delivers, then waits for the work the worker hands to ctx.waitUntil.
+  async function deliverSettled(to, { env = {}, ...opts } = {}) {
+    const msg = message({ to: to.includes("@") ? to : `${to}@${DOMAIN}`, ...opts });
+    const pending = [];
+    await worker.email(msg, { ...baseEnv, SENDER_TALLY: "on", ...env }, { waitUntil: (p) => pending.push(p) });
+    await Promise.all(pending);
+    return msg;
+  }
+
+  it("counts nothing unless SENDER_TALLY is on", async () => {
+    await deliverSettled(freshName(), { env: { SENDER_TALLY: undefined } });
+    await deliverSettled(freshName(), { env: { SENDER_TALLY: "yes" } });
+    expect(redis.commandsSent()).not.toContain("HINCRBY");
+  });
+
+  it.each(["on", " ON "])("with SENDER_TALLY=%j, counts stored mail by sending domain, kept 8 days", async (value) => {
+    await deliverSettled(freshName(), { env: { SENDER_TALLY: value } });
+    await deliverSettled(freshName(), { env: { SENDER_TALLY: value }, from: "hello@mail.app.example.com" });
+    expect(tally()).toEqual({ "free:example.com": 2 });
+    expect(redis.ttls.get(tallyKey())).toBe(8 * 24 * 60 * 60);
+  });
+
+  it("never records an address: consumer mailbox providers aren't counted", async () => {
+    const name = freshName();
+    await deliverSettled(name, { from: "someone@gmail.com" });
+    expect(redis.inbox(name)[0].otp).toBe(CODE);
+    expect(redis.hashes.has(tallyKey())).toBe(false);
+  });
+
+  it("counts an account's prefix as key and a Workspace's own domain as ws", async () => {
+    redis.strings.set("ns:k7x2", ACCOUNT_ID);
+    redis.strings.set("domain:qa.example", "k7x2");
+    await deliverSettled(freshName("k7x2-swift"));
+    await deliverSettled(`${freshName()}@qa.example`);
+    expect(tally()).toEqual({ "key:example.com": 1, "ws:example.com": 1 });
+  });
+
+  it("counts mail the keyless allowance held as held", async () => {
+    for (let i = 0; i < 6; i++) await deliverSettled(freshName());
+    expect(tally()).toEqual({ "free:example.com": 5, "held:example.com": 1 });
+  });
+
+  it("doesn't count rejected mail", async () => {
+    await deliverSettled(freshName(), { from: "noreply@tm.openai.com" });
+    redis.strings.set("ns:k7x2", "suspended");
+    await deliverSettled(freshName("k7x2-swift"));
+    expect(redis.hashes.has(tallyKey())).toBe(false);
+  });
+
+  it("never lets a failed count affect delivery", async () => {
+    redis.failPipeline("network", (commands) => commands.some((c) => c[0] === "HINCRBY"));
+    const name = freshName();
+    const msg = await deliverSettled(name);
+    expect(msg.rejected).toBeNull();
+    expect(redis.inbox(name)[0].otp).toBe(CODE);
+    expect(logs.some((l) => l.includes("Sender tally failed: network connection lost"))).toBe(true);
   });
 });
