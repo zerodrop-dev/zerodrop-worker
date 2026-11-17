@@ -9,7 +9,7 @@ Teams with strict compliance requirements can deploy their own instance of the Z
 - A Cloudflare account with Workers enabled
 - A domain added to Cloudflare (for Email Routing)
 - An Upstash Redis database (or any Redis-compatible REST API)
-- Node.js 18+ and Wrangler CLI
+- Node.js 22+ and Wrangler CLI
 
 ---
 

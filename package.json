@@ -2,6 +2,7 @@
   "name": "zerodrop-worker",
   "version": "0.0.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
@@ -9,9 +10,9 @@
     "test": "vitest"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.12.4",
+    "@cloudflare/vitest-plugin": "1.5.1",
     "fengari": "^0.1.5",
-    "vitest": "~3.2.0",
-    "wrangler": "^4.95.0"
+    "vitest": "4.1.12",
+    "wrangler": "4.157.0"
   }
 }
