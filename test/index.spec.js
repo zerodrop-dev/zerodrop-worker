@@ -73,7 +73,8 @@ const CODE = "482913";
 const SUBJECT = "Confirm your email";
 
 // Which of the worker's scripts an EVAL runs.
-const scriptName = (script) => (script.includes("LPUSH") ? "store" : script.includes("SCARD") ? "count" : "other");
+const scriptName = (script) =>
+  script.includes("LPUSH") ? "store" : script.includes("SCARD") ? "count" : script.includes("INCR") ? "quota" : "other";
 const isStore = (command) => command[0] === "EVAL" && scriptName(command[1]) === "store";
 
 function fakeRedis() {
@@ -100,6 +101,13 @@ function fakeRedis() {
         const numKeys = Number(args[0]);
         return evalLua(key, args.slice(1, 1 + numKeys), args.slice(1 + numKeys), run);
       }
+      case "INCR": {
+        const value = Number(strings.get(key) ?? 0) + 1;
+        strings.set(key, String(value));
+        return value;
+      }
+      case "EXISTS":
+        return strings.has(key) || lists.has(key) || sets.has(key) || hashes.has(key) ? 1 : 0;
       case "SCARD":
         return sets.get(key)?.size ?? 0;
       case "SISMEMBER":
@@ -187,7 +195,7 @@ function fakeRedis() {
       evalFailure = kind;
     },
     // How many times a script ran: "store" (STORE_SCRIPT, so how many emails
-    // were stored) or "count" (COUNT_SCRIPT).
+    // were stored), "count" (COUNT_SCRIPT) or "quota" (QUOTA_SCRIPT).
     scriptRuns(name) {
       return scriptsRun.filter((n) => n === name).length;
     },
@@ -303,7 +311,7 @@ describe("keyless allowance, enforced by default", () => {
     expect(notice.raw).toContain("https://zerodrop.dev/keys");
     expect(notice.raw).toContain("ZERODROP_API_KEY");
     // The clients raise an error with `reason`: the same text, on one line.
-    expect(notice.reason).toMatch(/^ZeroDrop held an email from example\.com to this inbox\. The email was not stored\. Without an API key, one sender can reach 5 different inboxes a day, .* https:\/\/zerodrop\.dev\/keys .*isn't limited\.$/);
+    expect(notice.reason).toMatch(/^ZeroDrop held an email from example\.com to this inbox\. The email was not stored\. Without an API key, one sender can reach 5 different inboxes a day, .* https:\/\/zerodrop\.dev\/keys .*counts toward your account's own limit of 300 emails a day instead\.$/);
     expect(notice.reason).not.toMatch(/[\r\n]/);
     expect(notice.raw.replace(/^[\s\S]*?\r\n\r\n/, "").trim().split(/\s+/).join(" ")).toBe(notice.reason);
     // Nothing from the held message reaches the notice.
@@ -510,6 +518,126 @@ describe("account prefixes", () => {
     expect(redis.commandsSent()).not.toContain("GET");
     await deliver(freshName("ab12"));
     expect(redis.commandsSent()).toContain("GET");
+  });
+});
+
+describe("account daily limit", () => {
+  const WS = "qa.example";
+  const quotaKey = (ns = "k7x2") => `quota:${ns}:${today()}`;
+  async function deliverTo(address, { env = {}, ...opts } = {}) {
+    const msg = message({ to: address, ...opts });
+    await worker.email(msg, { ...baseEnv, ...env }, { waitUntil() {} });
+    return msg;
+  }
+
+  beforeEach(() => {
+    redis.strings.set("ns:k7x2", ACCOUNT_ID);
+  });
+
+  it("counts an account's emails per UTC day, kept 2 days", async () => {
+    await deliver(freshName("k7x2-swift"));
+    await deliver(freshName("k7x2-swift"));
+    expect(redis.strings.get(quotaKey())).toBe("2");
+    expect(redis.ttls.get(quotaKey())).toBe(172800);
+  });
+
+  it("stores a key's 300th email of the day and holds the 301st: a notice is stored instead", async () => {
+    redis.strings.set(quotaKey(), "299");
+    const last = freshName("k7x2-swift");
+    await deliver(last);
+    expect(redis.inbox(last)[0].subject).toBe(SUBJECT);
+    const over = freshName("k7x2-swift");
+    const msg = await deliver(over);
+    expect(msg.rejected).toBeNull();
+    const [notice] = redis.inbox(over);
+    expect(notice.held).toBe(true);
+    expect(notice.from).toBe("notice@zerodrop.dev");
+    expect(notice.subject).toBe("ZeroDrop held an email: this account's daily limit");
+    expect(notice.reason).toBe(
+      "ZeroDrop held an email to this inbox. The email was not stored. This account's inboxes can receive " +
+        "300 emails a day, and they reached that today. The count starts again at 00:00 UTC. To raise the " +
+        "limit, write to support@zerodrop.dev."
+    );
+    expect(notice.raw.replace(/^[\s\S]*?\r\n\r\n/, "").trim().split(/\s+/).join(" ")).toBe(notice.reason);
+    expect(JSON.stringify(notice)).not.toContain(CODE);
+    expect(logs.some((l) => l.includes("Held over the account limit ns=k7x2 sender=example.com today=301 limit=300"))).toBe(true);
+  });
+
+  it("gives a Workspace 3,000 a day, on its own domain and on the shared one", async () => {
+    redis.strings.set(`domain:${WS}`, "k7x2");
+    redis.strings.set(quotaKey(), "2999");
+    const name = freshName();
+    await deliverTo(`${name}@${WS}`);
+    expect(redis.inbox(`k7x2-${name}`)[0].subject).toBe(SUBJECT);
+    redis.sets.set("wsdomains:k7x2", new Set([WS]));
+    const shared = freshName("k7x2-swift");
+    await deliver(shared);
+    expect(redis.inbox(shared)[0].reason).toContain("can receive 3,000 emails a day");
+  });
+
+  it("counts an account with its own retention as a Workspace", async () => {
+    redis.strings.set("ttl:k7x2", "86400");
+    redis.strings.set(quotaKey(), "2999");
+    const name = freshName("k7x2-swift");
+    await deliver(name);
+    expect(redis.inbox(name)[0].subject).toBe(SUBJECT);
+    expect(redis.ttls.get(`inbox:${name}`)).toBe(86400);
+  });
+
+  it("takes one account's limit from limit:{namespace}, where 0 holds everything", async () => {
+    redis.strings.set("limit:k7x2", "10");
+    redis.strings.set(quotaKey(), "10");
+    const name = freshName("k7x2-swift");
+    await deliver(name);
+    expect(redis.inbox(name)[0].reason).toContain("can receive 10 emails a day");
+    redis.strings.set("limit:k7x2", "0");
+    redis.strings.set(quotaKey(), "0");
+    const paused = freshName("k7x2-swift");
+    await deliver(paused);
+    expect(redis.inbox(paused)[0].held).toBe(true);
+  });
+
+  it("ignores a limit:{namespace} that isn't a number", async () => {
+    redis.strings.set("limit:k7x2", "lots");
+    redis.strings.set(quotaKey(), "299");
+    const name = freshName("k7x2-swift");
+    await deliver(name);
+    expect(redis.inbox(name)[0].subject).toBe(SUBJECT);
+  });
+
+  it("rejects mail past the limit and 50 notices, storing nothing", async () => {
+    redis.strings.set(quotaKey(), String(300 + 50));
+    const name = freshName("k7x2-swift");
+    const msg = await deliver(name);
+    expect(msg.rejected).toBe("Daily limit reached for this account");
+    expect(redis.inbox(name)).toHaveLength(0);
+    expect(logs.some((l) => l.includes("Rejected over the account limit ns=k7x2"))).toBe(true);
+  });
+
+  it("doesn't count keyless mail or an unregistered prefix, which have the allowance instead", async () => {
+    await deliver(freshName());
+    await deliver(freshName("ab12-swift"));
+    expect(redis.scriptRuns("quota")).toBe(0);
+  });
+
+  it("shadow stores mail past the limit and logs what it would hold; off doesn't count", async () => {
+    redis.strings.set(quotaKey(), "300");
+    const name = freshName("k7x2-swift");
+    await deliver(name, { env: { ACCOUNT_LIMIT_MODE: " Shadow " } });
+    expect(redis.inbox(name)[0].subject).toBe(SUBJECT);
+    expect(logs.some((l) => l.includes("Account limit would hold (shadow) ns=k7x2 sender=example.com today=301 limit=300"))).toBe(true);
+    await deliver(freshName("k7x2-swift"), { env: { ACCOUNT_LIMIT_MODE: "off" } });
+    expect(redis.strings.get(quotaKey())).toBe("301");
+  });
+
+  it.each(["network", "error-reply", "http-500"])("stores the email when the limit check fails (%s)", async (kind) => {
+    redis.strings.set(quotaKey(), "300");
+    redis.failPipeline(kind, (commands) => commands.some((c) => c[0] === "EVAL" && scriptName(c[1]) === "quota"));
+    const name = freshName("k7x2-swift");
+    const msg = await deliver(name);
+    expect(msg.rejected).toBeNull();
+    expect(redis.inbox(name)[0].subject).toBe(SUBJECT);
+    expect(logs.some((l) => l.includes("Account limit check error — allowing email through"))).toBe(true);
   });
 });
 

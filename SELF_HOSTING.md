@@ -83,7 +83,7 @@ npx wrangler secret put DOMAIN_MODE
 
 These are stored as encrypted secrets in Cloudflare — never in code or config files.
 
-**The keyless allowance doesn't apply on your own domain.** The worker counts only mail to `zerodrop-sandbox.online`, ZeroDrop's shared domain, so `CAP_ALLOWLIST`, `ALLOWLIST_UNTIL` and `ALLOWANCE_MODE` don't matter on a self-hosted instance.
+**The keyless allowance doesn't apply on your own domain.** The worker counts only mail to `zerodrop-sandbox.online`, ZeroDrop's shared domain, so `CAP_ALLOWLIST`, `ALLOWLIST_UNTIL` and `ALLOWANCE_MODE` don't matter on a self-hosted instance. The account daily limit (300 emails a day, 3,000 for a Workspace) applies only to accounts recorded in Redis (`ns:{prefix}`), which a self-hosted instance has only if you add them; `ACCOUNT_LIMIT_MODE=off` turns it off.
 
 ### 4. Deploy
 
@@ -125,7 +125,7 @@ ZERODROP_BASE_URL=https://your-dashboard.yourdomain.com
 
 The worker uses Upstash's REST API for Redis operations. If you want to use a different Redis provider:
 
-1. Any REST API compatible with Upstash's works — the worker sends everything to `/pipeline`: `GET` for account and Workspace records, and `EVAL` for two short Lua scripts, one that counts the keyless allowance and one that stores each email (`LPUSH`, `LTRIM`, `TTL` and `EXPIRE`). It reads keys named `ns:{prefix}`, `ttl:{prefix}` and `domain:{domain}`, so keep those names free for it
+1. Any REST API compatible with Upstash's works — the worker sends everything to `/pipeline`: `GET` for account and Workspace records, and `EVAL` for three short Lua scripts: one that counts the keyless allowance, one that counts an account's daily limit (`GET`, `EXISTS`, `INCR` and `EXPIRE`), and one that stores each email (`LPUSH`, `LTRIM`, `TTL` and `EXPIRE`). It reads keys named `ns:{prefix}`, `ttl:{prefix}`, `limit:{prefix}`, `wsdomains:{prefix}` and `domain:{domain}`, so keep those names free for it
 2. Update the fetch URLs in `src/index.js` to point to your Redis endpoint
 3. Set your auth token via `wrangler secret put`
 

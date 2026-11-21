@@ -17,14 +17,17 @@ ZeroDrop is a disposable email inbox service built for CI/CD pipelines. This doc
 - **Abuse counters** — for each sending domain (or full address, for consumer
   mailbox providers), the set of inbox names it reached in the current UTC day.
   Used only for the keyless allowance; expires after 2 days.
+- **Account counters** — for each account prefix, how many emails its inboxes
+  received in the current UTC day. Used only for the account's daily limit;
+  expires after 2 days.
 - **Sender tally** (only with `SENDER_TALLY=on`, as on zerodrop.dev) — for each
   sending domain, how many of its emails were stored or held each UTC day. Never
   an address: consumer mailbox providers aren't counted. Expires after 8 days.
 - **Workspace settings** — a Workspace's own receiving domain and retention,
   each recorded against its account prefix
-- **Held-mail notices** — when the keyless allowance holds an email, the inbox
-  gets a short notice from `notice@zerodrop.dev` in its place, naming only the
-  sender's domain. The held email itself is not stored. A notice is deleted with
+- **Held-mail notices** — when the keyless allowance or an account's daily
+  limit holds an email, the inbox gets a short notice from
+  `notice@zerodrop.dev` in its place, naming at most the sender's domain. The held email itself is not stored. A notice is deleted with
   its inbox, like any other message.
 
 ### Encryption
@@ -102,21 +105,27 @@ data reaches Redis. The worker:
    being farmed through free inboxes, on every domain, a Workspace's included
 3. Checks the inbox's account prefix, if it has one (`k7x2-…`): mail to a
    suspended or deleted account's prefix is rejected, because the read API
-   returns it to nobody; an active account's inboxes aren't counted in step 4
+   returns it to nobody; an active account's inboxes aren't counted in step 4,
+   and have the limit in step 5
 4. Applies a keyless allowance to mail for `zerodrop-sandbox.online`: 5
    different inboxes a day per sending domain (per address for consumer mailbox
    providers); a Workspace's own domain isn't counted. Mail past it is held: it isn't
    parsed or stored, and the inbox receives a short notice naming the sender's
    domain and how to get a free key
-5. Extracts OTP codes and magic links from the plain-text body
-6. Encrypts the message (see Encryption) and stores it under `inbox:{name}`
+5. Applies the account's daily limit to an active account's mail, on the
+   shared domain and its own domains together: 300 emails a UTC day with a free
+   key, 3,000 for a Workspace, unless `limit:{prefix}` in Redis sets another.
+   Mail past it is held the same way; past 50 notices in a day, it's rejected
+6. Extracts OTP codes and magic links from the plain-text body
+7. Encrypts the message (see Encryption) and stores it under `inbox:{name}`
    with its TTL (see Retention), atomically
 
 The allowance (4) ran in monitoring mode — logging what it would hold — from
 October 13, 2026 while API keys rolled out, and is now enforced. On the shared
 domain, if Redis can't answer the checks in steps 3 and 4, the mail is stored
 with the default 30 minutes rather than held or rejected; a Workspace's mail is
-never stored without them.
+never stored without them. If Redis can't answer the daily-limit check (5), the
+mail is stored, a Workspace's too.
 
 The worker source code is fully auditable:
 → https://github.com/zerodrop-dev/zerodrop-worker

@@ -58,7 +58,8 @@ function extractOtp(bodyText, plainTextParsed) {
 // inboxes per UTC day. Farming needs a fresh inbox for every fake account, so
 // it runs out at once; a developer testing their own app stays under it or
 // gets a free key, and inboxes under a key's namespace (k7x2-...) aren't
-// counted. Counted per sending domain, or per full address for consumer
+// counted: they have the account's daily limit instead (ACCOUNT DAILY LIMIT
+// below). Counted per sending domain, or per full address for consumer
 // mailbox providers. Only mail to the shared sandbox domain is counted: a
 // Workspace's own domain, or a self-hosted instance's, never is.
 // Replaced the hourly cap (20 an hour, shadow mode) on
@@ -250,6 +251,63 @@ function workspaceInbox(ns, inboxName) {
   return name.length <= 64 ? name : null;
 }
 
+// ============================================
+// ACCOUNT DAILY LIMIT
+// ============================================
+// Mail to an account's inboxes isn't counted against the keyless allowance, so
+// each account has a daily limit of its own instead. It keeps one account, or
+// a key made to farm sign-ups, from filling the database: KEY_LIMIT_PER_DAY
+// emails a UTC day for an account with a free key, WORKSPACE_LIMIT_PER_DAY for
+// a Workspace (an account with its own domain or its own retention). One count
+// per account, across the shared domain and the account's own domains, in
+// quota:{namespace}:{UTC date}, which expires after 2 days.
+//
+// Mail past the limit is held like mail past the keyless allowance: neither
+// parsed nor stored, with a notice in the inbox in its place. Past the limit
+// plus NOTICES_PER_DAY, it's rejected at SMTP instead, so a flood can't fill
+// the database with notices either. Held and rejected mail isn't added to the
+// sender tally.
+//
+// limit:{namespace} in Redis, a whole number, replaces the limit for one
+// account: SET limit:k7x2 10000 in the Upstash console raises it, and 0 holds
+// all of its mail. Fails open: if Redis can't answer, the email is stored.
+//
+// The optional ACCOUNT_LIMIT_MODE secret overrides the mode without a code
+// change, as ALLOWANCE_MODE does for the allowance:
+//   unset     — enforce
+//   "shadow"  — count and log "would hold", but store the email anyway
+//   "off"     — don't count at all
+//   npx wrangler secret put ACCOUNT_LIMIT_MODE       then type: shadow
+//   npx wrangler secret delete ACCOUNT_LIMIT_MODE    back to enforce
+const KEY_LIMIT_PER_DAY = 300;
+const WORKSPACE_LIMIT_PER_DAY = 3000;
+const NOTICES_PER_DAY = 50;
+
+function accountLimitMode(env) {
+  const mode = String(env.ACCOUNT_LIMIT_MODE || "").trim().toLowerCase();
+  return mode === "shadow" || mode === "off" ? mode : "enforce";
+}
+
+// Reading the limit and counting the email run as one script. KEYS[1] the
+// day's count, KEYS[2] limit:{namespace}, KEYS[3] wsdomains:{namespace} (the
+// account's own domains, if it has any); ARGV[1] the limit with a free key,
+// ARGV[2] a Workspace's, ARGV[3] "1" when the mail is known to be a
+// Workspace's. Returns {the account's emails today including this one, its
+// limit}.
+const QUOTA_SCRIPT = `
+local limit = tonumber(redis.call('GET', KEYS[2]))
+if not limit or limit < 0 then
+  if ARGV[3] == '1' or redis.call('EXISTS', KEYS[3]) == 1 then
+    limit = tonumber(ARGV[2])
+  else
+    limit = tonumber(ARGV[1])
+  end
+end
+local n = redis.call('INCR', KEYS[1])
+if n == 1 then redis.call('EXPIRE', KEYS[1], 172800) end
+return {n, limit}
+`;
+
 // What a held inbox receives instead of the email, so a test that waits for
 // mail fails with the reason rather than a timeout. Names the sender's domain,
 // never anything from the held message: for consumer mailbox providers, where
@@ -266,16 +324,33 @@ const HOST_NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[
 function noticePayload(to, domain, perAddress) {
   const named = HOST_NAME.test(domain || "") ? domain : null;
   const sender = named ? (perAddress ? `an address at ${named}` : named) : "this sender";
-  const paragraphs = [
+  return heldNotice(to, "ZeroDrop held an email: daily limit without an API key", [
     `ZeroDrop held an email from ${sender} to this inbox. The email was not stored.`,
     `Without an API key, one sender can reach ${ALLOWANCE_PER_DAY} different inboxes a day, ` +
       `and this sender reached that today.`,
     `Get a free key at https://zerodrop.dev/keys and set it as ZERODROP_API_KEY. ZeroDrop's ` +
       `clients then start new inbox names with your key's prefix, and mail to those inboxes ` +
-      `isn't limited.`,
-  ];
+      `counts toward your account's own limit of ${thousands(KEY_LIMIT_PER_DAY)} emails a day instead.`,
+  ]);
+}
+
+// What an account's inbox receives in place of an email past the account's
+// daily limit (ACCOUNT DAILY LIMIT). Nothing from the held email either.
+function limitNoticePayload(to, limit) {
+  return heldNotice(to, "ZeroDrop held an email: this account's daily limit", [
+    `ZeroDrop held an email to this inbox. The email was not stored.`,
+    `This account's inboxes can receive ${thousands(limit)} emails a day, and they reached that ` +
+      `today. The count starts again at 00:00 UTC.`,
+    `To raise the limit, write to support@zerodrop.dev.`,
+  ]);
+}
+
+function thousands(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+function heldNotice(to, subject, paragraphs) {
   const text = `${paragraphs.join("\n\n")}\n`;
-  const subject = "ZeroDrop held an email: daily limit without an API key";
   return {
     id: crypto.randomUUID(),
     from: "notice@zerodrop.dev",
@@ -477,6 +552,7 @@ export default {
     let held = false;
     let closed = false;
     let account = false;
+    let ownRetention = false;
     let ttl = DEFAULT_TTL;
     try {
       if (ns) {
@@ -485,6 +561,7 @@ export default {
         closed = state === "closed" || (workspace !== null && state === "unregistered");
         if (state === "active") ttl = retentionSeconds(retention);
         account = state === "active";
+        ownRetention = account && retention != null;
         if (state !== "unregistered") allowKey = null; // an account's inbox: not counted
       }
       if (allowKey) {
@@ -511,6 +588,44 @@ export default {
       console.log(`[ZeroDrop] Rejected mail to a closed prefix ns=${ns} sender=${domain}`);
       message.setReject("This inbox is closed");
       return;
+    }
+
+    // ============================================
+    // ACCOUNT DAILY LIMIT
+    // ============================================
+    // Only for an active account's mail: keyless mail has the allowance.
+    const limitMode = accountLimitMode(env);
+    let overLimit = null;
+    if (account && limitMode !== "off") {
+      try {
+        const [[count, limit]] = await redis(env, "/pipeline", [
+          [
+            "EVAL", QUOTA_SCRIPT, "3",
+            `quota:${ns}:${new Date().toISOString().slice(0, 10)}`, `limit:${ns}`, `wsdomains:${ns}`,
+            String(KEY_LIMIT_PER_DAY), String(WORKSPACE_LIMIT_PER_DAY), workspace || ownRetention ? "1" : "0",
+          ],
+        ]);
+        if (!Number.isInteger(count) || !Number.isInteger(limit)) throw new Error("unexpected reply from the quota script");
+        if (count > limit) overLimit = { count, limit };
+      } catch (limitError) {
+        console.log(`[ZeroDrop] Account limit check error — allowing email through: ${limitError.message}`);
+      }
+    }
+    if (overLimit) {
+      const { count, limit } = overLimit;
+      const state = `ns=${ns} sender=${domain} today=${count} limit=${limit}`;
+      if (limitMode === "shadow") {
+        console.log(`[ZeroDrop] Account limit would hold (shadow) ${state}`);
+      } else if (count > limit + NOTICES_PER_DAY) {
+        console.log(`[ZeroDrop] Rejected over the account limit ${state}`);
+        message.setReject("Daily limit reached for this account");
+        return;
+      } else {
+        // As with the allowance, the email itself is never parsed or stored.
+        console.log(`[ZeroDrop] Held over the account limit ${state}`);
+        await store(env, inboxName, limitNoticePayload(to, limit), ttl);
+        return;
+      }
     }
 
     if (held) {
