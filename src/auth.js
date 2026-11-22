@@ -164,7 +164,11 @@ export function authFromRaw(raw, headerFrom) {
   const dmarcs = methods(results[0], "dmarc");
   if (dmarcs.length > 1) return unknown;
   const dmarc = dmarcs[0] ?? null;
-  const spf = methods(results[0], "spf")[0]?.result ?? null;
+  // Cloudflare can check SPF twice: for the HELO name (smtp.helo) and for the
+  // envelope sender (smtp.mailfrom). Report the envelope sender's, or the
+  // first result when none names it.
+  const spfs = methods(results[0], "spf");
+  const spf = (spfs.find((m) => "smtp.mailfrom" in m.props) ?? spfs[0])?.result ?? null;
   const dkims = methods(results[0], "dkim");
   const dkim = dkims.length === 0 ? null : dkims.some((m) => m.result === "pass") ? "pass" : dkims[0].result;
 

@@ -91,6 +91,22 @@ describe("sender authentication: the pieces", () => {
     expect(parseAuthResults("mx.cloudflare.net; none").methods).toEqual([]);
   });
 
+  it("reports SPF for the envelope sender, not for the HELO name", () => {
+    // As Cloudflare wrote it for a Gmail email on Nov 22, 2026: HELO first.
+    const head = (spf) =>
+      [
+        "Received: from mail.example.net by cloudflare-email.net",
+        `Authentication-Results: mx.cloudflare.net; dkim=pass header.d=app.example.com; dmarc=pass header.from=app.example.com; ${spf}`,
+        "X-CF-SpamH-Score: 1",
+        "From: noreply@app.example.com",
+        "",
+        "body",
+      ].join("\r\n");
+    const both = head("spf=none smtp.helo=mail.example.net; spf=pass smtp.mailfrom=bounces@app.example.com");
+    expect(authOf(both)).toMatchObject({ result: "verified", spf: "pass" });
+    expect(authOf(head("spf=none smtp.helo=mail.example.net")).spf).toBe("none");
+  });
+
   it("reads addresses without display names, comments or quoted text", () => {
     expect(headerFromAddress("Example App <NoReply@App.Example.com>")).toBe("noreply@app.example.com");
     expect(headerFromAddress("noreply@app.example.com (Example App)")).toBe("noreply@app.example.com");
