@@ -1,0 +1,11 @@
+Authentication-Results: mx.cloudflare.net; dmarc=pass header.from=app.example.com
+Received: from app-server.internal by mail.app.example.com; Sat, 21 Nov 2026 21:59:59 +0000
+DKIM-Signature: v=1; a=rsa-sha256; d=app.example.com; s=s1; b=abc
+From: Example App <noreply@app.example.com>
+To: swift-x7k29ab@zerodrop-sandbox.online
+Subject: Your verification code
+Message-ID: <msg-1@app.example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Your verification code is 482915.

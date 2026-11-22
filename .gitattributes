@@ -1,0 +1,2 @@
+# The hostile test emails keep CRLF line endings, like real mail.
+test/fixtures/hostile/*.eml -text

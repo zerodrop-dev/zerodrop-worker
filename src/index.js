@@ -1,4 +1,5 @@
 import { storedForm } from "./encryption.js";
+import { authFromRaw, headerFromAddress } from "./auth.js";
 
 // Inbox names come from the recipient's local part, which the SENDER controls.
 // Accept only what real inboxes use: lowercase letters, digits, and . _ + -
@@ -286,6 +287,20 @@ const NOTICES_PER_DAY = 50;
 function accountLimitMode(env) {
   const mode = String(env.ACCOUNT_LIMIT_MODE || "").trim().toLowerCase();
   return mode === "shadow" || mode === "off" ? mode : "enforce";
+}
+
+// ============================================
+// SENDER AUTHENTICATION
+// ============================================
+// Each stored email carries the visible From address without its display name
+// (fromAddress) and what Cloudflare's own SPF, DKIM and DMARC checks said
+// about it (auth: verified, unverified, failed or unknown; see auth.js), so a
+// client can tell an agent whether the sender is who the From says.
+// AUTH_RESULTS=off stops reading the results without a code change:
+//   npx wrangler secret put AUTH_RESULTS      then type: off
+//   npx wrangler secret delete AUTH_RESULTS   back on
+function authResultsOn(env) {
+  return String(env.AUTH_RESULTS || "").trim().toLowerCase() !== "off";
 }
 
 // Reading the limit and counting the email run as one script. KEYS[1] the
@@ -646,6 +661,11 @@ export default {
     // ============================================
     const rawEmail = await new Response(message.raw).text();
 
+    // Who the visible From says sent it, and what Cloudflare's checks said.
+    const headerFrom = message.headers.get("from");
+    const fromAddress = headerFromAddress(headerFrom);
+    const auth = authResultsOn(env) ? authFromRaw(rawEmail, headerFrom) : null;
+
     // ============================================
     // OTP + MAGIC LINK EXTRACTION
     // Extracted at the edge so SDK and Action
@@ -679,16 +699,20 @@ export default {
     const emailPayload = {
       id: messageId,
       from,
+      fromAddress,
       to,
       subject,
       receivedAt: new Date().toISOString(),
       raw: rawEmail,
       otp,
       magicLink,
+      auth,
     };
 
     const encrypted = await store(env, inboxName, emailPayload, ttl);
-    console.log(`[ZeroDrop] Email from ${from} → inbox:${inboxName} encrypted=${encrypted ? "yes" : "no"}`);
+    console.log(
+      `[ZeroDrop] Email from ${from} → inbox:${inboxName} auth=${auth ? auth.result : "off"} encrypted=${encrypted ? "yes" : "no"}`
+    );
     tallySender(env, ctx, workspace ? "ws" : account ? "key" : "free", domain);
   },
 };

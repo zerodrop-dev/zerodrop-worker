@@ -1,0 +1,30 @@
+Received: from mail.app.example.com (mail.app.example.com [192.0.2.10]) by cloudflare-email.net (unknown) id 4bQx2k1Zz9 for <swift-x7k29ab@zerodrop-sandbox.online>; Sat, 21 Nov 2026 22:00:00 +0000
+ARC-Seal: i=1; a=rsa-sha256; s=2024; d=cloudflare-email.net; cv=none; b=AAAAexample
+ARC-Message-Signature: i=1; a=rsa-sha256; c=relaxed/relaxed; d=cloudflare-email.net; s=2024; h=From:To:Subject:Date; bh=BBBBexample; b=CCCCexample
+ARC-Authentication-Results: i=1; mx.cloudflare.net;
+	dkim=pass header.d=app.example.com header.s=s1 header.b=abc;
+	dmarc=pass header.from=app.example.com policy.dmarc=reject;
+	spf=pass (mx.cloudflare.net: domain of bounces@app.example.com designates 192.0.2.10 as permitted sender) smtp.mailfrom=bounces@app.example.com;
+	arc=none smtp.remote-ip=192.0.2.10
+Received-SPF: pass (mx.cloudflare.net: domain of bounces@app.example.com designates 192.0.2.10 as permitted sender) receiver=mx.cloudflare.net; client-ip=192.0.2.10; envelope-from="bounces@app.example.com"; helo=mail.app.example.com;
+Authentication-Results: mx.cloudflare.net;
+	dkim=pass header.d=app.example.com header.s=s1 header.b=abc;
+	dmarc=pass header.from=app.example.com policy.dmarc=reject;
+	spf=pass (mx.cloudflare.net: domain of bounces@app.example.com designates 192.0.2.10 as permitted sender) smtp.mailfrom=bounces@app.example.com;
+	arc=none smtp.remote-ip=192.0.2.10
+Authentication-Results: mx.cloudflare.net;
+	dkim=pass header.d=app.example.com header.s=s1 header.b=abc;
+	dmarc=pass header.from=app.example.com policy.dmarc=reject;
+	spf=pass (mx.cloudflare.net: domain of bounces@app.example.com designates 192.0.2.10 as permitted sender) smtp.mailfrom=bounces@app.example.com;
+	arc=none smtp.remote-ip=192.0.2.10
+X-CF-SpamH-Score: 1
+Received: from app-server.internal by mail.app.example.com; Sat, 21 Nov 2026 21:59:59 +0000
+DKIM-Signature: v=1; a=rsa-sha256; d=app.example.com; s=s1; b=abc
+From: Example App <noreply@app.example.com>
+To: swift-x7k29ab@zerodrop-sandbox.online
+Subject: Your verification code
+Message-ID: <msg-1@app.example.com>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Your verification code is 482915.

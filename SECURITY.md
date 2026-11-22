@@ -12,6 +12,10 @@ ZeroDrop is a disposable email inbox service built for CI/CD pipelines. This doc
 - **Inbox name** (e.g. `dark-gglag`) — derived from the recipient address
 - **Raw email payload** — MIME message including headers, subject, and body
 - **Received timestamp** — UTC time of receipt
+- **Sender** — the envelope sender, and the visible From address without its
+  display name
+- **Authentication result** — what Cloudflare's SPF, DKIM and DMARC checks said
+  about the sender: verified, unverified (no DMARC policy), failed or unknown
 - **Extracted OTP** — 4-8 digit code if detected in the email body (null otherwise)
 - **Extracted magic link** — verification or reset URL if detected (null otherwise)
 - **Abuse counters** — for each sending domain (or full address, for consumer
@@ -117,7 +121,11 @@ data reaches Redis. The worker:
    key, 3,000 for a Workspace, unless `limit:{prefix}` in Redis sets another.
    Mail past it is held the same way; past 50 notices in a day, it's rejected
 6. Extracts OTP codes and magic links from the plain-text body
-7. Encrypts the message (see Encryption) and stores it under `inbox:{name}`
+7. Reads Cloudflare's SPF, DKIM and DMARC verdict, only from Cloudflare's own
+   header block at the top of the message: a sender can add a header of the
+   same name lower down, and that one is ignored. Anything missing or unclear is
+   recorded as unknown, never as a pass
+8. Encrypts the message (see Encryption) and stores it under `inbox:{name}`
    with its TTL (see Retention), atomically
 
 The allowance (4) ran in monitoring mode — logging what it would hold — from
