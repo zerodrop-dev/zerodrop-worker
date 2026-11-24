@@ -214,7 +214,9 @@ function fakeRedis() {
 }
 
 // rawHead: headers to put above the message's own, as Cloudflare does.
-function message({ to, from = "noreply@app.example.com", headerFrom = `Example App <${from}>`, rawHead = "" }) {
+// plain: the text/plain part's lines, its headers, a blank line and its body.
+const PLAIN = ["Content-Type: text/plain; charset=utf-8", "", `Your verification code is ${CODE}.`];
+function message({ to, from = "noreply@app.example.com", headerFrom = `Example App <${from}>`, rawHead = "", plain = PLAIN }) {
   const raw = rawHead + [
     `From: ${headerFrom}`,
     `To: ${to}`,
@@ -224,9 +226,7 @@ function message({ to, from = "noreply@app.example.com", headerFrom = `Example A
     `Content-Type: multipart/alternative; boundary="b1"`,
     ``,
     `--b1`,
-    `Content-Type: text/plain; charset=utf-8`,
-    ``,
-    `Your verification code is ${CODE}.`,
+    ...plain,
     `--b1--`,
     ``,
   ].join("\r\n");
@@ -1323,5 +1323,48 @@ describe("sender authentication in stored emails", () => {
     const [notice] = redis.inbox(sixth);
     expect(notice.held).toBe(true);
     expect(notice.auth).toBeUndefined();
+  });
+});
+
+describe("plain-text part encodings", () => {
+  const LINK = "https://app.example.com/verify?token=ab12cd34ef";
+  const part = (headers, body) => [...headers, "", ...body];
+  async function extracted(plain) {
+    const name = freshName();
+    await deliver(name, { plain });
+    const [email] = redis.inbox(name);
+    return { otp: email.otp, magicLink: email.magicLink };
+  }
+
+  it("reads a 7bit part as sent, so =ab after a link's = sign stays as it is", async () => {
+    for (const headers of [
+      ["Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: 7bit"],
+      ["Content-Type: text/plain; charset=utf-8"], // no header means 7bit
+    ]) {
+      const body = [`Your code is ${CODE}.`, `Or confirm: ${LINK}`];
+      expect(await extracted(part(headers, body))).toEqual({ otp: CODE, magicLink: LINK });
+    }
+  });
+
+  it("keeps a 7bit line that ends in = apart from the next one", async () => {
+    const link = "https://app.example.com/verify?t=YWJjZA=";
+    const { magicLink } = await extracted(part(["Content-Type: text/plain; charset=utf-8"], [`Confirm: ${link}`, "Thanks"]));
+    expect(magicLink).toBe(link);
+  });
+
+  it("decodes quoted-printable, with its header after Content-Type or before it", async () => {
+    const body = [`Your code is ${CODE}.`, "Or confirm: https://app.example.com/verify?token=3Dab12=", "cd34ef"];
+    for (const headers of [
+      ["Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: quoted-printable"],
+      ["Content-Transfer-Encoding: Quoted-Printable", "Content-Type: text/plain; charset=utf-8"],
+    ]) {
+      expect(await extracted(part(headers, body))).toEqual({ otp: CODE, magicLink: LINK });
+    }
+  });
+
+  it("decodes a base64 part", async () => {
+    const lines = btoa(`Your code is ${CODE}.\r\nOr confirm: ${LINK}\r\n`).match(/.{1,76}/g);
+    const headers = ["Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64"];
+    expect(await extracted(part(headers, lines))).toEqual({ otp: CODE, magicLink: LINK });
   });
 });

@@ -1,4 +1,4 @@
-import { storedForm } from "./encryption.js";
+import { decodeBase64, storedForm } from "./encryption.js";
 import { authFromRaw, headerFromAddress } from "./auth.js";
 
 // Inbox names come from the recipient's local part, which the SENDER controls.
@@ -50,6 +50,40 @@ function extractOtp(bodyText, plainTextParsed) {
     return value;
   }
   return null;
+}
+
+// ============================================
+// PLAIN-TEXT PART DECODING
+// ============================================
+
+// The Content-Transfer-Encoding of the MIME part whose Content-Type header
+// starts at `at`, in lower case, or "" without one. It's read from that part's
+// own header block, which runs from the boundary line above it (or the top of
+// the message, for a single-part email) to the blank line after it, so the
+// header counts wherever it sits in the block.
+function partEncoding(raw, at) {
+  const boundary = raw.lastIndexOf("\n--", at);
+  const start = boundary === -1 ? 0 : raw.indexOf("\n", boundary + 1) + 1;
+  const end = raw.indexOf("\r\n\r\n", at);
+  const block = raw.slice(start, end === -1 ? raw.length : end);
+  const m = block.match(/^Content-Transfer-Encoding:[ \t]*([^\s;]+)/im);
+  return m ? m[1].toLowerCase() : "";
+}
+
+// A part's body, decoded for its Content-Transfer-Encoding: quoted-printable
+// (soft line breaks and =XX bytes) and base64 (read as UTF-8). Anything else
+// (7bit, 8bit, binary, no header) is the text as sent. Decoding =XX in text
+// that isn't quoted-printable broke links: in "?token=ab12", "=ab" became a
+// single stray character.
+function decodePart(body, encoding) {
+  if (encoding === "quoted-printable") {
+    return body.replace(/=\r\n/g, "").replace(/=([0-9A-F]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)));
+  }
+  if (encoding === "base64") {
+    const bytes = decodeBase64(body.replace(/\s+/g, ""));
+    return bytes ? new TextDecoder().decode(bytes) : body;
+  }
+  return body;
 }
 
 // ============================================
@@ -672,12 +706,13 @@ export default {
     // can expose them as first-class fields
     // ============================================
 
-    // Extract plain text body for parsing
+    // Extract plain text body for parsing, decoded the way its own
+    // Content-Transfer-Encoding says (decodePart)
     const plainMatch = rawEmail.match(
       /Content-Type: text\/plain[^\r\n]*\r\n(?:Content-Transfer-Encoding:[^\r\n]*\r\n)?\r\n([\s\S]*?)(?:\r\n--|\r\n\r\n--)/
     );
     const bodyText = plainMatch
-      ? plainMatch[1].replace(/=\r\n/g, "").replace(/=([0-9A-F]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16))).trim()
+      ? decodePart(plainMatch[1], partEncoding(rawEmail, plainMatch.index)).trim()
       : rawEmail;
 
     // Magic link — first https URL containing common auth path segments
