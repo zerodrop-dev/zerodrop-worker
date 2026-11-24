@@ -68,6 +68,12 @@ npx wrangler secret put AUTH_RESULTS
 # optional: "off" stops reading Cloudflare's SPF, DKIM and DMARC verdict
 # (each email's auth field is then null)
 
+npx wrangler secret put MIME_PARSER
+# optional: "on" parses each message in full (postal-mime): the code from the
+# decoded text, the magic link by its button text, and text, links and
+# attachment names stored with each email. On Workers Free the parse can take
+# an email past the 10 ms CPU limit, so use it with Workers Paid
+
 npx wrangler secret put INBOX_ENCRYPTION_KEY
 # optional: 32 random bytes, base64, e.g. from
 #   node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"

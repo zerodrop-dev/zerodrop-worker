@@ -1,5 +1,6 @@
 import { decodeBase64, storedForm } from "./encryption.js";
 import { authFromRaw, headerFromAddress } from "./auth.js";
+import { chooseMagicLink, mimeParserOn, parseMime } from "./parse.js";
 
 // Inbox names come from the recipient's local part, which the SENDER controls.
 // Accept only what real inboxes use: lowercase letters, digits, and . _ + -
@@ -84,6 +85,13 @@ function decodePart(body, encoding) {
     return bytes ? new TextDecoder().decode(bytes) : body;
   }
   return body;
+}
+
+// The body after the message's own headers. Links are never taken from the
+// headers, where List-Unsubscribe holds the unsubscribe link.
+function bodyAfterHeaders(raw) {
+  const m = /\r?\n\r?\n/.exec(raw);
+  return m ? raw.slice(m.index + m[0].length) : raw;
 }
 
 // ============================================
@@ -693,7 +701,9 @@ export default {
     // ============================================
     // PARSE EMAIL
     // ============================================
-    const rawEmail = await new Response(message.raw).text();
+    // The bytes for the MIME parser, the text for everything else.
+    const rawBytes = new Uint8Array(await new Response(message.raw).arrayBuffer());
+    const rawEmail = new TextDecoder().decode(rawBytes);
 
     // Who the visible From says sent it, and what Cloudflare's checks said.
     const headerFrom = message.headers.get("from");
@@ -706,27 +716,53 @@ export default {
     // can expose them as first-class fields
     // ============================================
 
-    // Extract plain text body for parsing, decoded the way its own
-    // Content-Transfer-Encoding says (decodePart)
-    const plainMatch = rawEmail.match(
-      /Content-Type: text\/plain[^\r\n]*\r\n(?:Content-Transfer-Encoding:[^\r\n]*\r\n)?\r\n([\s\S]*?)(?:\r\n--|\r\n\r\n--)/
+    // With MIME_PARSER=on, the whole message is parsed (src/parse.js): the
+    // code comes from the decoded text, and the magic link is the link the
+    // email shows as its action. Without it, or for a message the parser
+    // skips (over PARSE_MAX_BYTES, or refused), the regex path runs.
+    const parserOn = mimeParserOn(env);
+    const mime = parserOn ? await parseMime(rawBytes) : null;
+
+    let otp;
+    let magicLink;
+    let linkSource;
+    let parsedFields = {};
+    if (mime) {
+      // An HTML-only email's code can sit only in its subject: the regex path
+      // searched the whole raw message then, headers included, so the
+      // subject is searched too (labelled codes only).
+      otp = extractOtp(mime.text, mime.plainPart) ?? (mime.plainPart ? null : extractOtp(subject, false));
+      ({ url: magicLink, source: linkSource } = chooseMagicLink(mime.links, mime.listUnsubscribe));
+      parsedFields = { text: mime.text, links: mime.links, attachments: mime.attachments, parsed: true };
+    } else {
+      // Extract plain text body for parsing, decoded the way its own
+      // Content-Transfer-Encoding says (decodePart)
+      const plainMatch = rawEmail.match(
+        /Content-Type: text\/plain[^\r\n]*\r\n(?:Content-Transfer-Encoding:[^\r\n]*\r\n)?\r\n([\s\S]*?)(?:\r\n--|\r\n\r\n--)/
+      );
+      const bodyText = plainMatch
+        ? decodePart(plainMatch[1], partEncoding(rawEmail, plainMatch.index)).trim()
+        : rawEmail;
+
+      // Magic link — first https URL containing common auth path segments,
+      // never one from the headers
+      const magicLinkMatch = (plainMatch ? bodyText : bodyAfterHeaders(rawEmail)).match(
+        /https?:\/\/[^\s<>"]+(?:verify|confirm|reset|magic|token|activate|auth)[^\s<>"']*/i
+      );
+      magicLink = magicLinkMatch ? magicLinkMatch[0].replace(/[.,;!?)]+$/, "") : null;
+      linkSource = magicLink ? "url" : "none";
+
+      // OTP — labelled codes first, then a guarded bare-number fallback
+      otp = extractOtp(bodyText, Boolean(plainMatch));
+      if (parserOn) parsedFields = { parsed: false };
+    }
+
+    // Log presence only — never the code or the link itself. Worker logs are
+    // retained for 7 days; one-time codes must not outlive their inbox.
+    console.log(
+      `[ZeroDrop] Extracted — otp: ${otp ? "found" : "none"}, magicLink: ${magicLink ? "found" : "none"}, ` +
+        `link from: ${linkSource}, parsed: ${mime ? "yes" : parserOn ? "no" : "off"}, size: ${Math.ceil(rawBytes.byteLength / 1024)} KB`
     );
-    const bodyText = plainMatch
-      ? decodePart(plainMatch[1], partEncoding(rawEmail, plainMatch.index)).trim()
-      : rawEmail;
-
-    // Magic link — first https URL containing common auth path segments
-    const magicLinkMatch = bodyText.match(
-      /https?:\/\/[^\s<>"]+(?:verify|confirm|reset|magic|token|activate|auth)[^\s<>"']*/i
-    );
-    const magicLink = magicLinkMatch ? magicLinkMatch[0].replace(/[.,;!?)]+$/, "") : null;
-
-    // OTP — labelled codes first, then a guarded bare-number fallback
-    const otp = extractOtp(bodyText, Boolean(plainMatch));
-
-    // Log presence only — never the code itself. Worker logs are retained for
-    // 7 days; one-time codes must not outlive their inbox.
-    console.log(`[ZeroDrop] Extracted — otp: ${otp ? "found" : "none"}, magicLink: ${magicLink ? "found" : "none"}`);
 
     // ============================================
     // BUILD EMAIL PAYLOAD
@@ -742,6 +778,7 @@ export default {
       otp,
       magicLink,
       auth,
+      ...parsedFields,
     };
 
     const encrypted = await store(env, inboxName, emailPayload, ttl);

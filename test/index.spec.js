@@ -6,6 +6,7 @@ import * as lauxlib from "fengari/src/lauxlib.js";
 import { luaopen_base } from "fengari/src/lbaselib.js";
 import { to_luastring } from "fengari/src/fengaricore.js";
 import worker from "../src";
+import { chooseMagicLink, collectLinks, htmlToText, LINKS_MAX, PARSE_MAX_BYTES } from "../src/parse.js";
 import { decodeBase64, toBase64url } from "../src/encryption.js";
 
 // The email handler, run against an in-memory stand-in for Upstash's REST API
@@ -215,25 +216,30 @@ function fakeRedis() {
 
 // rawHead: headers to put above the message's own, as Cloudflare does.
 // plain: the text/plain part's lines, its headers, a blank line and its body.
+// mime: everything after MIME-Version instead (more headers, Content-Type, a
+// blank line and the body), for a message of another shape.
 const PLAIN = ["Content-Type: text/plain; charset=utf-8", "", `Your verification code is ${CODE}.`];
-function message({ to, from = "noreply@app.example.com", headerFrom = `Example App <${from}>`, rawHead = "", plain = PLAIN }) {
+function message({
+  to,
+  from = "noreply@app.example.com",
+  headerFrom = `Example App <${from}>`,
+  rawHead = "",
+  plain = PLAIN,
+  mime = null,
+  subject = SUBJECT,
+}) {
   const raw = rawHead + [
     `From: ${headerFrom}`,
     `To: ${to}`,
-    `Subject: ${SUBJECT}`,
+    `Subject: ${subject}`,
     `Message-ID: <msg-1@app.example.com>`,
     `MIME-Version: 1.0`,
-    `Content-Type: multipart/alternative; boundary="b1"`,
-    ``,
-    `--b1`,
-    ...plain,
-    `--b1--`,
-    ``,
+    ...(mime ?? [`Content-Type: multipart/alternative; boundary="b1"`, ``, `--b1`, ...plain, `--b1--`, ``]),
   ].join("\r\n");
   const msg = {
     from,
     to,
-    headers: new Headers({ from: headerFrom, to, subject: SUBJECT, "message-id": "<msg-1@app.example.com>" }),
+    headers: new Headers({ from: headerFrom, to, subject, "message-id": "<msg-1@app.example.com>" }),
     raw: new Response(raw).body,
     rawSize: raw.length,
     rejected: null,
@@ -1366,5 +1372,239 @@ describe("plain-text part encodings", () => {
     const lines = btoa(`Your code is ${CODE}.\r\nOr confirm: ${LINK}\r\n`).match(/.{1,76}/g);
     const headers = ["Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64"];
     expect(await extracted(part(headers, lines))).toEqual({ otp: CODE, magicLink: LINK });
+  });
+});
+
+describe("MIME parser (MIME_PARSER=on)", () => {
+  // The seven emails of claude/testing-plan-2026-10-26.md, Phase 1, then the size guard.
+  const ON = { MIME_PARSER: "on" };
+  const LINK = "https://app.example.com/verify?token=ab12cd34ef";
+  const alternative = (...parts) => [
+    `Content-Type: multipart/alternative; boundary="b1"`,
+    ``,
+    ...parts.flatMap((part) => [`--b1`, ...part]),
+    `--b1--`,
+    ``,
+  ];
+  async function stored(opts, env = ON) {
+    const name = freshName();
+    await deliver(name, { env, ...opts });
+    return redis.inbox(name)[0];
+  }
+
+  it("is off unless MIME_PARSER is on, and the stored email keeps its shape", async () => {
+    const email = await stored({}, {});
+    expect(email.otp).toBe(CODE);
+    for (const field of ["text", "links", "attachments", "parsed"]) expect(email).not.toHaveProperty(field);
+    expect(logs.some((l) => l.includes("link from: none, parsed: off"))).toBe(true);
+  });
+
+  it("1. a text part without a Content-Transfer-Encoding line", async () => {
+    const email = await stored({
+      mime: alternative(["Content-Type: text/plain; charset=utf-8", "", `Your code is ${CODE}.`, `Confirm: ${LINK}`]),
+    });
+    expect(email).toMatchObject({ otp: CODE, magicLink: LINK, parsed: true });
+    expect(email.text).toBe(`Your code is ${CODE}.\nConfirm: ${LINK}`);
+    expect(email.links).toEqual([{ url: LINK, text: "" }]);
+  });
+
+  it("2. quoted-printable text and HTML, as ESPs send them: the link the button names", async () => {
+    const email = await stored({
+      mime: alternative(
+        ["Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: quoted-printable", "", `Your code is ${CODE}.`, "Verify: https://app.example.com/verify?token=3Dab12cd34ef"],
+        ["Content-Type: text/html; charset=utf-8", "Content-Transfer-Encoding: quoted-printable", "", `<p>Your code is ${CODE}.</p><a href=3D"https://app.example.com/verify?token=3Dab12cd34ef" class=3D"btn">Verify email</a>`],
+      ),
+    });
+    expect(email).toMatchObject({ otp: CODE, magicLink: LINK });
+    expect(email.links).toEqual([{ url: LINK, text: "Verify email" }]);
+    expect(logs.some((l) => l.includes("link from: anchor, parsed: yes"))).toBe(true);
+  });
+
+  it("3. a base64 text part", async () => {
+    const lines = btoa(`Your code is ${CODE}.\r\nConfirm: ${LINK}\r\n`).match(/.{1,76}/g);
+    const email = await stored({
+      mime: alternative(["Content-Type: text/plain; charset=utf-8", "Content-Transfer-Encoding: base64", "", ...lines]),
+    });
+    expect(email).toMatchObject({ otp: CODE, magicLink: LINK, parsed: true });
+  });
+
+  it("4. HTML only, quoted-printable: the link decoded, the text without tags", async () => {
+    const email = await stored({
+      mime: [
+        "Content-Type: text/html; charset=utf-8",
+        "Content-Transfer-Encoding: quoted-printable",
+        "",
+        `<html><head><style>p{color:red}</style></head><body><p>Your verification code: <b>${CODE}</b></p>`,
+        `<a href=3D"https://app.example.com/verify?token=3Dq1w2e3r4&amp;u=3D7">Confirm your email</a></body></html>`,
+        "",
+      ],
+    });
+    expect(email.otp).toBe(CODE);
+    expect(email.magicLink).toBe("https://app.example.com/verify?token=q1w2e3r4&u=7");
+    expect(email.text).toBe(`Your verification code: ${CODE}\n\nConfirm your email`);
+  });
+
+  it("5. a click-tracked link: the one whose button says verify", async () => {
+    const tracked = "https://click.mailer.example/ls/click?upn=u001.Zx9Yq7";
+    const email = await stored({
+      mime: alternative(
+        ["Content-Type: text/plain; charset=utf-8", "", `Verify your email: ${tracked}`, "Help: https://app.example.com/help"],
+        [
+          "Content-Type: text/html; charset=utf-8",
+          "",
+          `<a href="https://click.mailer.example/ls/click?upn=u001.Logo1"><img src="https://app.example.com/logo.png" alt=""></a>`,
+          `<a href="${tracked}" style="background:#06c">Verify email address</a>`,
+          `<a href="https://app.example.com/help">Help</a>`,
+        ],
+      ),
+    });
+    expect(email.magicLink).toBe(tracked);
+    expect(email.links.map((l) => l.text)).toEqual(["", "Verify email address", "Help"]);
+  });
+
+  it("6. HTML only, with List-Unsubscribe: never the unsubscribe or preferences link", async () => {
+    const email = await stored({
+      mime: [
+        "List-Unsubscribe: <https://app.example.com/u?token=zz9>, <mailto:unsub@app.example.com>",
+        "Content-Type: text/html; charset=utf-8",
+        "",
+        `<a href="https://app.example.com/u?token=zz9">Stop these emails</a>`,
+        `<a href="https://app.example.com/email/preferences?token=pp1">Email preferences</a>`,
+        `<a href="https://app.example.com/activate?token=act1">Get started</a>`,
+        "",
+      ],
+    });
+    expect(email.magicLink).toBe("https://app.example.com/activate?token=act1");
+    expect(logs.some((l) => l.includes("link from: url, parsed: yes"))).toBe(true);
+  });
+
+  it("6, without the parser: the regex path no longer takes a link from the headers", async () => {
+    const email = await stored(
+      {
+        mime: [
+          "List-Unsubscribe: <https://app.example.com/u?token=zz9>",
+          "Content-Type: text/html; charset=utf-8",
+          "",
+          `<a href="https://app.example.com/activate?token=act1">Get started</a>`,
+          "",
+        ],
+      },
+      {},
+    );
+    expect(email.magicLink).toBe("https://app.example.com/activate?token=act1");
+  });
+
+  it("7. a folded Content-Type header", async () => {
+    const email = await stored({
+      mime: [
+        "Content-Type: multipart/alternative;",
+        '\tboundary="b1"',
+        "",
+        "--b1",
+        "Content-Type: text/plain;",
+        '\tcharset="utf-8"',
+        "Content-Transfer-Encoding: quoted-printable",
+        "",
+        `Your code is ${CODE}.`,
+        "Verify: https://app.example.com/verify?token=3Dab12cd=",
+        "34ef",
+        "--b1--",
+        "",
+      ],
+    });
+    expect(email).toMatchObject({ otp: CODE, magicLink: LINK });
+  });
+
+  it("over PARSE_MAX_BYTES: the regex path, stored with parsed: false and no parsed fields", async () => {
+    const attachment = Array.from({ length: Math.ceil(PARSE_MAX_BYTES / 78) + 10 }, () => "A".repeat(76));
+    const email = await stored({
+      mime: [
+        `Content-Type: multipart/mixed; boundary="m1"`,
+        "",
+        "--m1",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        `Your code is ${CODE}.`,
+        "--m1",
+        "Content-Type: application/pdf; name=invoice.pdf",
+        "Content-Transfer-Encoding: base64",
+        'Content-Disposition: attachment; filename="invoice.pdf"',
+        "",
+        ...attachment,
+        "--m1--",
+        "",
+      ],
+    });
+    expect(email).toMatchObject({ otp: CODE, parsed: false });
+    for (const field of ["text", "links", "attachments"]) expect(email).not.toHaveProperty(field);
+    expect(logs.some((l) => l.includes("parsed: no"))).toBe(true);
+  });
+
+  it("lists attachments by name, type and size, never their content", async () => {
+    const email = await stored({
+      mime: [
+        `Content-Type: multipart/mixed; boundary="m1"`,
+        "",
+        "--m1",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        `Your code is ${CODE}.`,
+        "--m1",
+        "Content-Type: application/pdf; name=invoice.pdf",
+        "Content-Transfer-Encoding: base64",
+        'Content-Disposition: attachment; filename="invoice.pdf"',
+        "",
+        btoa("%PDF-1.4 test"),
+        "--m1--",
+        "",
+      ],
+    });
+    expect(email.attachments).toEqual([{ filename: "invoice.pdf", mimeType: "application/pdf", size: 13 }]);
+  });
+
+  it("still finds an HTML-only email's code in its subject", async () => {
+    const email = await stored({
+      subject: `Your verification code: ${CODE}`,
+      mime: ["Content-Type: text/html; charset=utf-8", "", "<p>Use the code in the subject line.</p>", ""],
+    });
+    expect(email.otp).toBe(CODE);
+  });
+});
+
+describe("choosing the magic link", () => {
+  it("prefers a button's words, verify over a sign-in link before it, either over an auth word in a URL", () => {
+    const links = [
+      { url: "https://app.example.com/login?token=t1", text: "Log in" },
+      { url: "https://track.example/c/abc", text: "Verify email" },
+      { url: "https://app.example.com/x?token=t2", text: "" },
+    ];
+    expect(chooseMagicLink(links)).toEqual({ url: "https://track.example/c/abc", source: "anchor" });
+    expect(chooseMagicLink(links.slice(0, 1))).toEqual({ url: "https://app.example.com/login?token=t1", source: "anchor" });
+    expect(chooseMagicLink(links.slice(2))).toEqual({ url: "https://app.example.com/x?token=t2", source: "url" });
+    expect(chooseMagicLink([])).toEqual({ url: null, source: "none" });
+  });
+
+  it("reads hrefs and anchor text: entities decoded, image alt text, one entry per URL, http(s) only", () => {
+    const html = [
+      `<a href="https://app.example.com/v?a=1&amp;b=2">Confirm&nbsp;email</a>`,
+      `<a href='https://app.example.com/v?a=1&b=2'>again</a>`,
+      `<a href="https://app.example.com/start"><img src="x.png" alt="Get started"></a>`,
+      `<a href="mailto:help@app.example.com">Mail us</a><a href="javascript:alert(1)">x</a>`,
+      `<!--[if mso]><a href="https://app.example.com/mso">Outlook</a><![endif]-->`,
+    ].join("\n");
+    expect(collectLinks(html, "See https://app.example.com/plain.")).toEqual([
+      { url: "https://app.example.com/v?a=1&b=2", text: "Confirm email" },
+      { url: "https://app.example.com/start", text: "Get started" },
+      { url: "https://app.example.com/plain", text: "" },
+    ]);
+  });
+
+  it("keeps at most LINKS_MAX links", () => {
+    const html = Array.from({ length: LINKS_MAX + 20 }, (_, i) => `<a href="https://app.example.com/${i}">${i}</a>`).join("");
+    expect(collectLinks(html, "")).toHaveLength(LINKS_MAX);
+  });
+
+  it("makes text from HTML without its head, styles or tags", () => {
+    expect(htmlToText("<head><title>T</title></head><style>p{}</style><p>Hi&amp;bye</p><p>Line<br>two</p>")).toBe("Hi&bye\nLine\ntwo");
   });
 });

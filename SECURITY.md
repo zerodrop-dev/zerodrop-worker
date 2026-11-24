@@ -18,6 +18,10 @@ ZeroDrop is a disposable email inbox service built for CI/CD pipelines. This doc
   about the sender: verified, unverified (no DMARC policy), failed or unknown
 - **Extracted OTP** — 4-8 digit code if detected in the email body (null otherwise)
 - **Extracted magic link** — verification or reset URL if detected (null otherwise)
+- **Parsed text, links and attachment names** (only with `MIME_PARSER=on`) — the
+  decoded plain text (at most 20,000 characters), each link with the text it's
+  shown with (at most 100), and each attachment's name, type and size, never its
+  content. Deleted with the inbox, like the rest of the email.
 - **Abuse counters** — for each sending domain (or full address, for consumer
   mailbox providers), the set of inbox names it reached in the current UTC day.
   Used only for the keyless allowance; expires after 2 days.
@@ -67,7 +71,9 @@ deletes it.
 
 ### Logs
 Cloudflare retains this worker's logs for 7 days. They record the sender, the
-recipient, the message size, and whether an OTP or magic link was found —
+recipient, the message size, whether an OTP or magic link was found, where the
+link was found (its anchor text, its URL, or nowhere) and whether the message
+was parsed —
 **never the subject line, the body, or the code or link itself**. Subject lines
 are left out because many services put the one-time code in them.
 
